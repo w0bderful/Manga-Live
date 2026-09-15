@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
-TRANSLATION_MODES = {'luna': 'Luna (Kie API)', 'deepl': 'DeepL API',
+TRANSLATION_MODES = {'luna': 'Luna (Kie API)', 'deepl': 'DeepL Free',
                      'openai': 'OpenAI 호환 API (주소 직접 입력)'}
 TRANSLATION_PROMPT = (
     'Translate Japanese manga dialogue into natural Korean. Preserve tone and meaning. '

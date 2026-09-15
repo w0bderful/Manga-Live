@@ -1,28 +1,23 @@
-# 가상환경과 다운로드한 OCR 모델
 /.venv/
 /.models/
 
-# Python 실행 캐시
 __pycache__/
 *.py[cod]
 
-# 실행 로그
 *.log
 
-# 로컬 환경 변수 (공유용 예제는 포함)
 .env
 .env.*
 !.env.example
 
-# API 키와 이전 형식의 키 파일
 /api-keys.json
 /kie-api-key.json
 /deepl-api-key.json
 /api-key-backups/
 
-# 개인 단축키 설정
 /hotkeys.json
 
-# 설정 저장 중 생성되는 임시 파일
 /api-keys.json.tmp
 /hotkeys.json.tmp
+
+/tests/

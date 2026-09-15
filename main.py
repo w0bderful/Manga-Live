@@ -450,7 +450,7 @@ class Controller(QWidget):
         self.api_key.setVisible(initial_provider == 'luna')
         self.deepl_api_key = QLineEdit(initial_deepl_api_key)
         self.deepl_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.deepl_api_key.setPlaceholderText('DeepL API 키 (api-keys.json · deepl_api_key에 평문 저장)')
+        self.deepl_api_key.setPlaceholderText('DeepL Free API 키 (api-keys.json · deepl_api_key에 평문 저장)')
         self.deepl_api_key.textChanged.connect(lambda: self.api_key_save_timer.start())
         layout.addWidget(self.deepl_api_key)
         self.deepl_api_key.setVisible(initial_provider == 'deepl')
