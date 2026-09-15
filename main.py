@@ -21,11 +21,13 @@ import time
 import numpy as np
 from PIL import Image, ImageFilter
 from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap
+from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap, QAction, QActionGroup
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-                            QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout)
+                            QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout,
+                            QMenuBar, QDialog, QScrollArea, QGridLayout)
 from core import Box, changed, text_boxes, relocate, merge_row, scroll_offset, move_rows, restore_occluded
-from translation import create_translation_client, TRANSLATION_MODES, validate_openai_settings, list_openai_models
+from translation import (create_translation_client, TRANSLATION_MODES, validate_openai_settings,
+                         list_openai_models, get_deepl_usage)
 from ocr_backends import OcrBackend, MODES, validate_device
 from api_settings import (load_api_key, save_api_keys, load_openai_settings, OPENAI_DEFAULTS,
                           load_translation_provider)
@@ -45,6 +47,19 @@ def request_model_list(base_url, api_key):
             future.set_exception(exc)
 
     threading.Thread(target=fetch, daemon=True, name='model-list').start()
+    return future
+
+
+def request_deepl_usage(api_key):
+    future = Future()
+
+    def fetch():
+        try:
+            future.set_result(get_deepl_usage(api_key))
+        except Exception as exc:
+            future.set_exception(exc)
+
+    threading.Thread(target=fetch, daemon=True, name='deepl-usage').start()
     return future
 
 
@@ -404,20 +419,44 @@ class Controller(QWidget):
         self.engine = Engine(self.signals, device='cuda', api_key=initial_keys[initial_provider],
                              provider=initial_provider, base_url=initial_openai_settings['base_url'],
                              model=initial_openai_settings['model'])
-        layout = QVBoxLayout(self)
+        self.main_layout = layout = QVBoxLayout(self)
+        self.menu_bar = QMenuBar(self)
+        self.menu_bar.setNativeMenuBar(False)
+        layout.setMenuBar(self.menu_bar)
+        settings_menu = self.menu_bar.addMenu('설정')
+        self.open_settings_action = settings_menu.addAction('설정 열기…')
+        self.open_settings_action.setShortcut('Ctrl+,')
+        self.open_settings_action.triggered.connect(self.open_settings)
+        settings_menu.addSeparator()
+        self.interface_modes = QActionGroup(self)
+        self.interface_modes.setExclusive(True)
+        self.basic_mode_action = QAction('기본 모드', self, checkable=True)
+        self.advanced_mode_action = QAction('고급 모드', self, checkable=True)
+        for action, mode in [(self.basic_mode_action, 'basic'), (self.advanced_mode_action, 'advanced')]:
+            self.interface_modes.addAction(action)
+            settings_menu.addAction(action)
+            action.triggered.connect(lambda checked, selected=mode: self.set_interface_mode(selected))
         heading = QLabel('화면의 일본어를 원래 위치에 한국어로 표시합니다.')
         heading_row = QHBoxLayout()
         heading_row.addWidget(heading)
         self.always_on_top = QCheckBox('최상단 고정')
-        self.always_on_top.setToolTip('설정 창을 다른 앱보다 위에 표시합니다.')
+        self.always_on_top.setToolTip('프로그램 창을 다른 앱보다 위에 표시합니다.')
         self.always_on_top.setChecked(True)
         self.always_on_top.toggled.connect(self.set_always_on_top)
         heading_row.addWidget(self.always_on_top)
         layout.addLayout(heading_row)
+        self.inline_settings = QScrollArea()
+        self.inline_settings.setWidgetResizable(True)
+        layout.addWidget(self.inline_settings, 1)
+        self.settings_panel = QWidget()
+        self.settings_layout = layout = QVBoxLayout(self.settings_panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(QLabel('모니터'))
         self.screens = QComboBox()
         for screen in QApplication.screens():
             self.screens.addItem(screen.name(), screen)
         layout.addWidget(self.screens)
+        layout.addWidget(QLabel('OCR 처리 장치'))
         device_row = QHBoxLayout()
         self.device_mode = QComboBox()
         self.device_mode.addItem('CPU 모드', 'cpu')
@@ -428,11 +467,15 @@ class Controller(QWidget):
         self.device_apply.clicked.connect(self.change_device)
         device_row.addWidget(self.device_apply)
         layout.addLayout(device_row)
+        layout.addWidget(QLabel('OCR 방식'))
         self.ocr_mode = QComboBox()
         for key, label in MODES.items():
             self.ocr_mode.addItem(label, key)
         layout.addWidget(self.ocr_mode)
-        layout.addWidget(QLabel('OCR을 선택한 뒤 모드 적용을 누르세요. OpenCV 감지는 CPU에서 실행됩니다.'))
+        ocr_note = QLabel('OCR을 선택한 뒤 설정 적용을 누르세요. OpenCV 감지는 CPU에서 실행됩니다.')
+        ocr_note.setWordWrap(True)
+        layout.addWidget(ocr_note)
+        layout.addWidget(QLabel('번역 API'))
         self.translation_mode = QComboBox()
         for key, label in TRANSLATION_MODES.items():
             self.translation_mode.addItem(label, key)
@@ -450,10 +493,33 @@ class Controller(QWidget):
         self.api_key.setVisible(initial_provider == 'luna')
         self.deepl_api_key = QLineEdit(initial_deepl_api_key)
         self.deepl_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.deepl_api_key.setPlaceholderText('DeepL Free API 키 (api-keys.json · deepl_api_key에 평문 저장)')
+        self.deepl_api_key.setPlaceholderText('DeepL API 키 (Free / Pro 자동 선택 · 평문 저장)')
         self.deepl_api_key.textChanged.connect(lambda: self.api_key_save_timer.start())
         layout.addWidget(self.deepl_api_key)
         self.deepl_api_key.setVisible(initial_provider == 'deepl')
+        self.deepl_usage_panel = QWidget()
+        usage_layout = QVBoxLayout(self.deepl_usage_panel)
+        usage_layout.setContentsMargins(0, 0, 0, 0)
+        self.deepl_usage_note = QLabel('DeepL API 키를 입력하세요.')
+        self.deepl_usage_note.setWordWrap(True)
+        usage_layout.addWidget(self.deepl_usage_note)
+        self.main_layout.addWidget(self.deepl_usage_panel)
+        self.deepl_usage_panel.setVisible(initial_provider == 'deepl')
+        self.deepl_usage_future = None
+        self.deepl_usage_generation = 0
+        self.deepl_usage_closed = False
+        self.deepl_usage_debounce = QTimer(self)
+        self.deepl_usage_debounce.setSingleShot(True)
+        self.deepl_usage_debounce.setInterval(800)
+        self.deepl_usage_debounce.timeout.connect(self.load_deepl_usage)
+        self.deepl_usage_poll = QTimer(self)
+        self.deepl_usage_poll.setInterval(100)
+        self.deepl_usage_poll.timeout.connect(self.finish_deepl_usage)
+        self.deepl_usage_refresh = QTimer(self)
+        self.deepl_usage_refresh.setInterval(300_000)
+        self.deepl_usage_refresh.timeout.connect(self.load_deepl_usage)
+        self.deepl_api_key.textChanged.connect(self.invalidate_deepl_usage)
+        self.invalidate_deepl_usage()
         self.openai_panel = QWidget()
         openai_form = QFormLayout(self.openai_panel)
         openai_form.setContentsMargins(0, 0, 0, 0)
@@ -505,26 +571,38 @@ class Controller(QWidget):
         self.api_settings_note.setWordWrap(True)
         layout.addWidget(self.api_settings_note)
         self.translation_mode.currentIndexChanged.connect(self.update_translation_fields)
-        row = QHBoxLayout()
+        self.action_panel = QWidget()
+        row = QGridLayout(self.action_panel)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
         self.select_button = QPushButton('영역 선택')
         self.select_button.clicked.connect(self.select_region)
-        row.addWidget(self.select_button)
+        row.addWidget(self.select_button, 0, 0)
         self.drag_button = QPushButton('드래그 번역')
         self.drag_button.clicked.connect(lambda: self.select_region(single_shot=True))
-        row.addWidget(self.drag_button)
-        self.toggle_button = QPushButton('시작')
+        row.addWidget(self.drag_button, 0, 1)
+        self.toggle_button = QPushButton('번역 시작')
         self.toggle_button.clicked.connect(self.toggle)
-        row.addWidget(self.toggle_button)
+        row.addWidget(self.toggle_button, 1, 0)
         self.retry_button = QPushButton('다시 번역')
         self.retry_button.clicked.connect(self.retry_translation)
-        row.addWidget(self.retry_button)
-        layout.addLayout(row)
+        row.addWidget(self.retry_button, 1, 1)
+        for button in (self.select_button, self.drag_button, self.toggle_button, self.retry_button):
+            button.setMinimumHeight(60)
+            font = button.font()
+            font.setPointSize(14)
+            font.setBold(True)
+            button.setFont(font)
+        self.main_layout.addWidget(self.action_panel)
+        layout.addWidget(QLabel('영역 선택 · 드래그 번역 · 번역 시작 · 다시 번역 단축키'))
         self.hotkey_button = QPushButton('단축키 설정')
         self.hotkey_button.clicked.connect(self.configure_hotkeys)
         layout.addWidget(self.hotkey_button)
+        layout.addWidget(QLabel('번역 모드'))
         self.manual = QCheckBox('선택 영역 전체가 말풍선 하나 (자동 감지 생략)')
         self.manual.toggled.connect(self.reset_frame)
         layout.addWidget(self.manual)
+        layout.addWidget(QLabel('감지 해상도'))
         self.detection_mode = QComboBox()
         self.detection_mode.addItem('원본 해상도 (기본 · 축소 없이 감지)', None)
         self.detection_mode.addItem('빠른 감지 (작은 글자는 놓칠 수 있음)', 960)
@@ -535,10 +613,10 @@ class Controller(QWidget):
         layout.addWidget(QLabel('Discord 개별 창 공유: Manga Live · 일본어 → 한국어 창을 선택하세요.'))
         self.status = QLabel('준비 중…')
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        self.main_layout.addWidget(self.status)
         self.capture_note = QLabel('')
         self.capture_note.setWordWrap(True)
-        layout.addWidget(self.capture_note)
+        self.main_layout.addWidget(self.capture_note)
         note = QLabel('말풍선별로 번역이 끝나는 즉시 표시합니다. 스크롤하면 번역 위치를 추적합니다.\n인식한 대사를 선택한 번역 서비스로 전송합니다 (이용 요금 발생 가능). 이미지는 전송하지 않습니다. 종료하려면 이 창을 닫으세요.')
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -560,7 +638,51 @@ class Controller(QWidget):
         self.hotkey_note.setWordWrap(True)
         layout.addWidget(self.hotkey_note)
         self.update_hotkey_note(hotkey_errors)
+        layout.addStretch()
+        self.settings_dialog = QDialog(self)
+        self.settings_dialog.setWindowTitle('Manga Live 설정')
+        dialog_layout = QVBoxLayout(self.settings_dialog)
+        self.dialog_settings = QScrollArea()
+        self.dialog_settings.setWidgetResizable(True)
+        dialog_layout.addWidget(self.dialog_settings)
+        close_settings = QPushButton('닫기')
+        close_settings.clicked.connect(self.settings_dialog.close)
+        dialog_layout.addWidget(close_settings)
+        self.interface_mode = None
+        self.set_interface_mode('basic')
         self.engine.start()
+
+    def set_interface_mode(self, mode):
+        if mode == self.interface_mode:
+            return
+        self.settings_dialog.hide()
+        for scroll in (self.inline_settings, self.dialog_settings):
+            if scroll.widget() is self.settings_panel:
+                scroll.takeWidget()
+        advanced = mode == 'advanced'
+        target = self.inline_settings if advanced else self.dialog_settings
+        target.setWidget(self.settings_panel)
+        self.settings_panel.show()
+        self.inline_settings.setVisible(advanced)
+        self.capture_note.setVisible(advanced)
+        self.interface_mode = mode
+        self.basic_mode_action.setChecked(not advanced)
+        self.advanced_mode_action.setChecked(advanced)
+        self.open_settings_action.setText('설정으로 이동' if advanced else '설정 열기…')
+        self.main_layout.activate()
+        available = self.screen().availableGeometry()
+        self.resize(560 if advanced else 510, min(850, available.height() - 80) if advanced else self.minimumSizeHint().height())
+
+    def open_settings(self):
+        if self.interface_mode == 'advanced':
+            self.inline_settings.ensureWidgetVisible(self.screens)
+            self.screens.setFocus()
+            return
+        available = self.screen().availableGeometry()
+        self.settings_dialog.resize(560, min(760, available.height() - 80))
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
 
     def update_hotkey_note(self, errors=()):
         buttons = {'select': self.select_button, 'drag': self.drag_button,
@@ -590,7 +712,8 @@ class Controller(QWidget):
         self.hotkey_dialog_open = True
         self.hotkeys.clear()
         try:
-            dialog = HotkeyDialog(self, self.hotkeys, self.hotkey_settings)
+            parent = self.settings_dialog if self.settings_dialog.isVisible() else self
+            dialog = HotkeyDialog(parent, self.hotkeys, self.hotkey_settings)
             if dialog.exec():
                 self.hotkey_settings = dialog.settings
                 errors = []
@@ -624,6 +747,8 @@ class Controller(QWidget):
         provider = self.translation_mode.currentData()
         self.api_key.setVisible(provider == 'luna')
         self.deepl_api_key.setVisible(provider == 'deepl')
+        self.deepl_usage_panel.setVisible(provider == 'deepl')
+        self.invalidate_deepl_usage()
         self.openai_panel.setVisible(provider == 'openai')
         self.worker_ready = False
         self.engine.stop_event.set()
@@ -638,7 +763,52 @@ class Controller(QWidget):
         self.running = resume_snapshot
         self.latest = snapshot
         self.reference = snapshot.copy() if snapshot is not None else None
-        self.toggle_button.setText('취소' if resume_snapshot else '시작')
+        self.toggle_button.setText('취소' if resume_snapshot else '번역 시작')
+
+    def invalidate_deepl_usage(self):
+        self.deepl_usage_generation += 1
+        self.deepl_usage_debounce.stop()
+        self.deepl_usage_refresh.stop()
+        has_key = bool(self.deepl_api_key.text().strip())
+        self.deepl_usage_note.setText('남은 한도 확인 대기 중…' if has_key else 'DeepL API 키를 입력하세요.')
+        if not self.deepl_usage_closed and has_key and self.translation_mode.currentData() == 'deepl':
+            self.deepl_usage_debounce.start()
+            self.deepl_usage_refresh.start()
+
+    def load_deepl_usage(self):
+        if (self.deepl_usage_closed or self.translation_mode.currentData() != 'deepl'
+                or self.deepl_usage_future is not None or not self.deepl_api_key.text().strip()):
+            return
+        self.deepl_usage_debounce.stop()
+        self.deepl_usage_request_generation = self.deepl_usage_generation
+        self.deepl_usage_note.setText('남은 한도 조회 중…')
+        try:
+            self.deepl_usage_future = request_deepl_usage(self.deepl_api_key.text().strip())
+        except Exception:
+            self.deepl_usage_note.setText('사용량 조회를 시작하지 못했습니다. 다시 조회하세요.')
+            return
+        self.deepl_usage_poll.start()
+
+    def finish_deepl_usage(self):
+        if self.deepl_usage_future is None or not self.deepl_usage_future.done():
+            return
+        future, self.deepl_usage_future = self.deepl_usage_future, None
+        self.deepl_usage_poll.stop()
+        if self.deepl_usage_request_generation != self.deepl_usage_generation:
+            if not self.deepl_usage_closed and self.translation_mode.currentData() == 'deepl':
+                self.deepl_usage_debounce.start()
+            return
+        try:
+            usage = future.result()
+        except (ValueError, RuntimeError) as exc:
+            self.deepl_usage_note.setText(str(exc))
+            return
+        except Exception:
+            self.deepl_usage_note.setText('DeepL 사용량을 확인하지 못했습니다. 다시 조회하세요.')
+            return
+        remaining = ('남은 한도: 제한 없음' if usage['remaining'] is None else
+                     f"남은 번역 가능 문자: {usage['remaining']:,}자")
+        self.deepl_usage_note.setText(remaining)
 
     def load_initial_api_key(self, provider):
         try:
@@ -811,14 +981,14 @@ class Controller(QWidget):
                 self.submit_snapshot()
             return
         label = 'GPU (CUDA)' if self.engine.device == 'cuda' else 'CPU'
-        self.status.setText(f'{label} · {MODES[self.engine.ocr_mode]} · {TRANSLATION_MODES[self.engine.provider]} 준비 완료 (OCR은 첫 요청 시 로딩) · 시작을 누르세요.')
+        self.status.setText(f'{label} · {MODES[self.engine.ocr_mode]} · {TRANSLATION_MODES[self.engine.provider]} 준비 완료 (OCR은 첫 요청 시 로딩) · 번역 시작을 누르세요.')
 
     def processing_failed(self, engine, generation, message):
         if engine is not self.engine or not engine.valid(generation):
             return
         if self.single_shot:
             self.running = False
-            self.toggle_button.setText('시작')
+            self.toggle_button.setText('번역 시작')
             self.show()
         self.status.setText(message)
 
@@ -835,7 +1005,7 @@ class Controller(QWidget):
         except Exception as exc:
             log.warning('Capture mode configuration failed: %s', exc)
             self.running = False
-            self.toggle_button.setText('시작')
+            self.toggle_button.setText('번역 시작')
             self.status.setText(f'화면공유 설정 실패: {exc}')
             return False
         self.update_capture_mode()
@@ -845,7 +1015,7 @@ class Controller(QWidget):
         self.capture.invalidate()
         if self.single_shot:
             self.running = False
-            self.toggle_button.setText('시작')
+            self.toggle_button.setText('번역 시작')
         self.engine.generation += 1
         self.result_floor = self.engine.generation
         self.engine.cancel_before = self.result_floor
@@ -856,8 +1026,9 @@ class Controller(QWidget):
         self.overlay.clear()
 
     def select_region(self, single_shot=False):
+        self.settings_dialog.hide()
         self.running = False
-        self.toggle_button.setText('시작')
+        self.toggle_button.setText('번역 시작')
         self.reset_frame()
         self.single_shot = single_shot
         self.region = None
@@ -884,7 +1055,7 @@ class Controller(QWidget):
         except OSError as exc:
             self.running = False
             self.reset_frame()
-            self.toggle_button.setText('시작')
+            self.toggle_button.setText('번역 시작')
             self.overlay.hide()
             self.show()
             log.exception('Selected region lookup failed')
@@ -899,7 +1070,7 @@ class Controller(QWidget):
         if self.single_shot:
             self.capture_snapshot()
             return
-        self.status.setText('영역 선택 완료 · 시작을 누르세요.')
+        self.status.setText('영역 선택 완료 · 번역 시작을 누르세요.')
         self.update_capture_mode()
         self.show()
 
@@ -936,7 +1107,7 @@ class Controller(QWidget):
                 self.status.setText('영역 캡처 완료 · 번역 설정이 적용되면 자동으로 번역합니다.')
         except Exception as exc:
             self.running = False
-            self.toggle_button.setText('시작')
+            self.toggle_button.setText('번역 시작')
             self.show()
             log.exception('Snapshot capture failed')
             self.status.setText(f'캡처 실패: {exc} — 다시 번역을 눌러 재시도하세요.')
@@ -963,7 +1134,7 @@ class Controller(QWidget):
         if self.running:
             self.running = False
             self.reset_frame()
-            self.toggle_button.setText('시작')
+            self.toggle_button.setText('번역 시작')
             self.status.setText('드래그 번역을 취소했습니다.' if self.single_shot else '일시정지')
             return
         if not self.translation_is_current():
@@ -975,7 +1146,7 @@ class Controller(QWidget):
         self.single_shot = False
         self.update_capture_mode()
         self.running = not self.running
-        self.toggle_button.setText('일시정지' if self.running else '시작')
+        self.toggle_button.setText('일시정지' if self.running else '번역 시작')
         self.reset_frame()
         if self.running:
             self.overlay.show()
@@ -1011,7 +1182,7 @@ class Controller(QWidget):
             self.submit_pending_frame()
         except Exception as exc:
             self.running = False
-            self.toggle_button.setText('시작')
+            self.toggle_button.setText('번역 시작')
             self.reset_frame()
             log.exception('Capture failed')
             self.status.setText(f'캡처 실패: {exc}')
@@ -1040,7 +1211,7 @@ class Controller(QWidget):
         if self.running and generation == self.engine.generation:
             if self.single_shot:
                 self.running = False
-                self.toggle_button.setText('시작')
+                self.toggle_button.setText('번역 시작')
                 if self.overlay.rows:
                     self.status.setText(f'드래그 번역 완료 · {len(self.overlay.rows)}개 영역 표시 · 다시 번역으로 재실행')
                 else:
@@ -1049,6 +1220,13 @@ class Controller(QWidget):
                 self.status.setText(f'{len(self.overlay.rows)}개 영역 표시 · 화면 변화 대기 중')
 
     def closeEvent(self, event):
+        self.settings_dialog.close()
+        self.deepl_usage_closed = True
+        self.deepl_usage_debounce.stop()
+        self.deepl_usage_poll.stop()
+        self.deepl_usage_refresh.stop()
+        self.deepl_usage_future = None
+        self.deepl_usage_generation += 1
         self.models_timer.stop()
         self.models_future = None
         self.models_generation += 1

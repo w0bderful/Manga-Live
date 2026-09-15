@@ -1,22 +1,16 @@
 /.venv/
 /.models/
-
 __pycache__/
 *.py[cod]
-
 *.log
-
 .env
 .env.*
 !.env.example
-
 /api-keys.json
 /kie-api-key.json
 /deepl-api-key.json
 /api-key-backups/
-
 /hotkeys.json
-
 /api-keys.json.tmp
 /hotkeys.json.tmp
 

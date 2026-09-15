@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
-TRANSLATION_MODES = {'luna': 'Luna (Kie API)', 'deepl': 'DeepL Free',
+TRANSLATION_MODES = {'luna': 'Luna (Kie API)', 'deepl': 'DeepL API (Free / Pro 자동 선택)',
                      'openai': 'OpenAI 호환 API (주소 직접 입력)'}
 TRANSLATION_PROMPT = (
     'Translate Japanese manga dialogue into natural Korean. Preserve tone and meaning. '
@@ -170,10 +170,66 @@ class OpenAICompatibleTranslationClient:
         return SimpleNamespace(text=result.strip())
 
 
+def deepl_host(api_key):
+    key = api_key.strip()
+    if not key:
+        raise ValueError('DeepL API 키를 입력하세요.')
+    validate_api_key(key)
+    return 'api-free.deepl.com' if key.endswith(':fx') else 'api.deepl.com'
+
+
+def get_deepl_usage(api_key):
+    key = api_key.strip()
+    host = deepl_host(key)
+    connection = http.client.HTTPSConnection(host, timeout=15)
+    try:
+        connection.request('GET', '/v2/usage', headers={
+            'Authorization': f'DeepL-Auth-Key {key}', 'User-Agent': 'MangaLive/1.0'})
+        response = connection.getresponse()
+        if not 200 <= response.status < 300:
+            hint = {401: 'API 키를 확인하세요.', 403: 'API 키와 API 요금제를 확인하세요.',
+                    429: '잠시 후 다시 조회하세요.', 456: '번역 사용 한도를 초과했습니다.'}.get(
+                        response.status, '서버 상태를 확인하고 다시 조회하세요.')
+            raise RuntimeError(f'DeepL 사용량 조회 실패 (HTTP {response.status}): {hint}')
+        try:
+            data = json.loads(response.read().decode('utf-8'))
+        except (ValueError, UnicodeError):
+            raise RuntimeError('DeepL 사용량 응답을 해석할 수 없습니다.') from None
+        return parse_deepl_usage(data, free=key.endswith(':fx'))
+    except (OSError, http.client.HTTPException):
+        raise RuntimeError('DeepL 사용량 연결 실패 또는 시간 초과입니다. 다시 조회하세요.') from None
+    finally:
+        connection.close()
+
+
+def parse_deepl_usage(data, *, free):
+    def count(field):
+        value = data.get(field) if isinstance(data, dict) else None
+        if type(value) is not int or value < 0:
+            raise RuntimeError('DeepL 사용량 응답의 문자 수 또는 한도가 올바르지 않습니다.')
+        return value
+
+    used, limit = count('character_count'), count('character_limit')
+    # DeepL returns this sentinel for an unconfigured Pro account/key limit.
+    if not free and limit == 1_000_000_000_000:
+        limit = None
+    key_used = key_limit = None
+    if 'api_key_character_count' in data or 'api_key_character_limit' in data:
+        key_used, key_limit = count('api_key_character_count'), count('api_key_character_limit')
+        if not free and key_limit == 1_000_000_000_000:
+            key_limit = None
+    remaining = [max(0, limit - used)] if limit is not None else []
+    if key_limit is not None:
+        remaining.append(max(0, key_limit - key_used))
+    return dict(plan='Free' if free else 'Pro', used=used, limit=limit,
+                key_used=key_used, key_limit=key_limit,
+                remaining=min(remaining) if remaining else None)
+
+
 class DeepLTranslationClient:
     def __init__(self, api_key):
         self.api_key = api_key.strip()
-        self.host = 'api-free.deepl.com' if self.api_key.endswith(':fx') else 'api.deepl.com'
+        self.host = deepl_host(self.api_key)
         self.connection = None
 
     async def __aenter__(self):

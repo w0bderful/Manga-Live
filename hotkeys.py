@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFormLayou
                             QVBoxLayout, QWidget)
 
 ACTIONS = {'select': '영역 선택', 'drag': '드래그 번역',
-           'toggle': '시작 / 일시정지 / 취소', 'retry': '다시 번역'}
+           'toggle': '번역 시작 / 일시정지 / 취소', 'retry': '다시 번역'}
 DEFAULTS = dict(zip(ACTIONS, ('Ctrl+Alt+1', 'Ctrl+Alt+2', 'Ctrl+Alt+3', 'Ctrl+Alt+4')))
 SETTINGS_FILE = Path(__file__).resolve().parent / 'hotkeys.json'
 WM_HOTKEY = 0x0312
