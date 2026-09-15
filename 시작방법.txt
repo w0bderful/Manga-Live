@@ -1,0 +1,10 @@
+처음시작
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+py main.py
+
+
+설치완료시
+.venv\Scripts\activate
+py main.py

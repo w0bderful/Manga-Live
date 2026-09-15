@@ -1,9 +1,7 @@
 .venv/
 .models/
 __pycache__/
-*.py[cod]
 *.log
 .env
 .env.*
 api-keys.json
-시작방법.txt
