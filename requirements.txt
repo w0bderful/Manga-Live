@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.0+cu130
+torchvision==0.29.0+cu130
+
+manga-ocr==0.1.16
+PyQt6>=6.7,<7
+mss>=10.2,<11
+Pillow>=10
+numpy>=1.26
+easyocr==1.7.2
+opencv-python-headless>=4.10,<6
+transformers>=5.13,<6
+sentencepiece>=0.2
