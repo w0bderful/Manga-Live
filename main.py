@@ -368,7 +368,7 @@ class Controller(QWidget):
         self.control_excluded = True
         self.signals = Signals()
         initial_api_key = load_api_key()
-        self.engine = Engine(self.signals, api_key=initial_api_key)
+        self.engine = Engine(self.signals, device='cuda', api_key=initial_api_key)
         layout = QVBoxLayout(self)
         heading = QLabel('화면의 일본어를 원래 위치에 한국어로 표시합니다.')
         layout.addWidget(heading)
@@ -380,6 +380,7 @@ class Controller(QWidget):
         self.device_mode = QComboBox()
         self.device_mode.addItem('CPU 모드', 'cpu')
         self.device_mode.addItem('GPU 모드 (NVIDIA CUDA)', 'cuda')
+        self.device_mode.setCurrentIndex(self.device_mode.findData(self.engine.device))
         device_row.addWidget(self.device_mode)
         self.device_apply = QPushButton('설정 적용')
         self.device_apply.clicked.connect(self.change_device)
