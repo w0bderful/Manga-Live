@@ -10,7 +10,6 @@ from concurrent.futures import Future
 import ctypes
 from ctypes import wintypes
 import logging
-import math
 import hashlib
 import queue
 import re
@@ -18,14 +17,13 @@ import sys
 import threading
 import time
 
-import numpy as np
 from PIL import Image, ImageFilter
-from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QEvent
+from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap, QAction, QActionGroup
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                             QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout,
                             QMenuBar, QDialog, QScrollArea, QGridLayout)
-from core import Box, changed, text_boxes, relocate, merge_row, scroll_offset, move_rows, restore_occluded
+from core import changed, relocate, merge_row, scroll_offset, move_rows
 from translation import (create_translation_client, TRANSLATION_MODES, validate_openai_settings,
                          list_openai_models, get_deepl_usage)
 from ocr_backends import OcrBackend, MODES, validate_device
@@ -33,7 +31,6 @@ from api_settings import (load_api_key, save_api_keys, load_openai_settings, OPE
                           load_translation_provider)
 from window_capture import CaptureWithoutApp
 from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
-from ui_settings import MENU_ITEMS, load_menu_items, save_menu_items
 
 log = logging.getLogger(__name__)
 
@@ -66,16 +63,9 @@ def request_deepl_usage(api_key):
 
 def windows_api():
     api = ctypes.WinDLL('user32', use_last_error=True)
-    api.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
-    api.SetWindowDisplayAffinity.restype = wintypes.BOOL
     api.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     api.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
     return api
-
-
-def allow_capture(widget):
-    if not windows_api().SetWindowDisplayAffinity(int(widget.winId()), 0):
-        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def native_region(widget):
@@ -241,36 +231,15 @@ class Overlay(QWidget):
         self.rows = []
         self.source_size = (1, 1)
         self.rendered = QImage()
-        self.capture_history = {}
         self.setMask(QRegion(-2, -2, 1, 1))
 
-    def current_capture_boxes(self):
-
-        px = max(0, math.ceil(8*self.source_size[0]/max(1, self.width()))-12)
-        py = max(0, math.ceil(8*self.source_size[1]/max(1, self.height()))-12)
-        return [Box(b.x-px, b.y-py, b.w+2*px, b.h+2*py) for b, _ in self.rows]
-
-    def remember_capture_boxes(self):
-        now = time.monotonic()
-        self.capture_history = {b: expiry for b, expiry in self.capture_history.items() if expiry > now}
-        for box in self.current_capture_boxes():
-            self.capture_history[box] = now+0.45
-
-    def capture_boxes(self):
-        now = time.monotonic()
-        self.capture_history = {b: expiry for b, expiry in self.capture_history.items() if expiry > now}
-
-        return list(set(self.current_capture_boxes()) | self.capture_history.keys())
-
     def clear(self):
-        self.remember_capture_boxes()
         self.rows = []
         self.rendered = QImage()
         self.setMask(QRegion(-2, -2, 1, 1))
         self.update()
 
     def display(self, rows, source_size, background=None):
-        self.remember_capture_boxes()
         self.rows = rows
         self.source_size = source_size
         layer = QImage(self.size(), QImage.Format.Format_RGBA8888)
@@ -398,8 +367,6 @@ class Controller(QWidget):
         self.single_shot = False
         self.worker_ready = False
         self.result_floor = 0
-        self.overlay_excluded = True
-        self.control_excluded = True
         self.signals = Signals()
         self.api_settings_error = False
         initial_api_key = self.load_initial_api_key('luna')
@@ -424,22 +391,20 @@ class Controller(QWidget):
         self.menu_bar = QMenuBar(self)
         self.menu_bar.setNativeMenuBar(False)
         layout.setMenuBar(self.menu_bar)
-        self.settings_menu = settings_menu = self.menu_bar.addMenu('설정')
-        self.open_settings_action = settings_menu.addAction('설정 창 따로 열기')
+        self.open_settings_action = QAction('설정창 열기', self)
+        self.addAction(self.open_settings_action)
         self.open_settings_action.setShortcut('Ctrl+,')
         self.open_settings_action.triggered.connect(self.open_settings)
-        settings_menu.addSeparator()
         self.interface_modes = QActionGroup(self)
         self.interface_modes.setExclusive(True)
         self.basic_mode_action = QAction('기본 모드', self, checkable=True)
         self.advanced_mode_action = QAction('고급 모드', self, checkable=True)
         for action, mode in [(self.basic_mode_action, 'basic'), (self.advanced_mode_action, 'advanced')]:
             self.interface_modes.addAction(action)
-            settings_menu.addAction(action)
+            self.menu_bar.addAction(action)
             action.triggered.connect(lambda checked, selected=mode: self.set_interface_mode(selected))
-        heading = QLabel('화면의 일본어를 원래 위치에 한국어로 표시합니다.')
         heading_row = QHBoxLayout()
-        heading_row.addWidget(heading)
+        heading_row.addStretch()
         self.always_on_top = QCheckBox('최상단 고정')
         self.always_on_top.setToolTip('프로그램 창을 다른 앱보다 위에 표시합니다.')
         self.always_on_top.setChecked(True)
@@ -450,7 +415,7 @@ class Controller(QWidget):
         self.inline_settings.setWidgetResizable(True)
         layout.addWidget(self.inline_settings, 1)
         self.settings_panel = QWidget()
-        self.settings_layout = layout = QVBoxLayout(self.settings_panel)
+        layout = QVBoxLayout(self.settings_panel)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(QLabel('모니터'))
         self.screens = QComboBox()
@@ -483,7 +448,6 @@ class Controller(QWidget):
         self.translation_mode.setCurrentIndex(self.translation_mode.findData(initial_provider))
         layout.addWidget(self.translation_mode)
         self.api_key = QLineEdit(initial_api_key)
-        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText('Kie API 키 (api-keys.json · kie_api_key에 평문 저장)')
         self.api_key_save_timer = QTimer(self)
         self.api_key_save_timer.setSingleShot(True)
@@ -493,7 +457,6 @@ class Controller(QWidget):
         layout.addWidget(self.api_key)
         self.api_key.setVisible(initial_provider == 'luna')
         self.deepl_api_key = QLineEdit(initial_deepl_api_key)
-        self.deepl_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.deepl_api_key.setPlaceholderText('DeepL API 키 (Free / Pro 자동 선택 · 평문 저장)')
         self.deepl_api_key.textChanged.connect(lambda: self.api_key_save_timer.start())
         layout.addWidget(self.deepl_api_key)
@@ -527,7 +490,6 @@ class Controller(QWidget):
         self.openai_base_url = QLineEdit(initial_openai_settings['base_url'])
         self.openai_base_url.setPlaceholderText('https://서버주소/v1 또는 전체 /chat/completions 주소')
         self.openai_api_key = QLineEdit(initial_openai_api_key)
-        self.openai_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.openai_api_key.setPlaceholderText('인증이 없는 로컬 서버는 비워도 됩니다')
         for label, field in [('API 주소', self.openai_base_url), ('API 키', self.openai_api_key)]:
             openai_form.addRow(label, field)
@@ -595,11 +557,9 @@ class Controller(QWidget):
             font.setBold(True)
             button.setFont(font)
         self.main_layout.addWidget(self.action_panel)
-        layout.addWidget(QLabel('영역 선택 · 드래그 번역 · 번역 시작 · 다시 번역 단축키'))
         self.hotkey_button = QPushButton('단축키 설정')
         self.hotkey_button.clicked.connect(self.configure_hotkeys)
         layout.addWidget(self.hotkey_button)
-        layout.addWidget(QLabel('번역 모드'))
         self.manual = QCheckBox('선택 영역 전체가 말풍선 하나 (자동 감지 생략)')
         self.manual.toggled.connect(self.reset_frame)
         layout.addWidget(self.manual)
@@ -611,7 +571,6 @@ class Controller(QWidget):
         self.detection_mode.addItem('정밀 감지 (작은 글씨 · 느림)', 1920)
         self.detection_mode.currentIndexChanged.connect(self.change_detection_mode)
         layout.addWidget(self.detection_mode)
-        layout.addWidget(QLabel('Discord 개별 창 공유: Manga Live · 일본어 → 한국어 창을 선택하세요.'))
         self.status = QLabel('준비 중…')
         self.status.setWordWrap(True)
         self.main_layout.addWidget(self.status)
@@ -652,93 +611,7 @@ class Controller(QWidget):
         dialog_layout.addWidget(close_settings)
         self.interface_mode = None
         self.set_interface_mode('basic')
-        self.configure_settings_menu()
         self.engine.start()
-
-    def configure_settings_menu(self):
-        self.menu_actions = {'basic': self.basic_mode_action, 'advanced': self.advanced_mode_action,
-                             'window': self.open_settings_action}
-        self.settings_menu.addSeparator()
-        for key, combo in [('monitor', self.screens), ('provider', self.translation_mode),
-                           ('device', self.device_mode), ('ocr', self.ocr_mode),
-                           ('resolution', self.detection_mode)]:
-            menu = self.settings_menu.addMenu(MENU_ITEMS[key])
-            menu.aboutToShow.connect(lambda menu=menu, combo=combo: self.fill_choice_menu(menu, combo))
-            self.menu_actions[key] = menu.menuAction()
-        translation_menu = self.settings_menu.addMenu(MENU_ITEMS['translation'])
-        translation_menu.aboutToShow.connect(lambda: self.fill_translation_menu(translation_menu))
-        self.menu_actions['translation'] = translation_menu.menuAction()
-        for key, callback in [('hotkeys', self.configure_hotkeys), ('apply', self.change_device)]:
-            action = self.settings_menu.addAction(MENU_ITEMS[key])
-            action.triggered.connect(callback)
-            self.menu_actions[key] = action
-        self.settings_menu.aboutToShow.connect(self.sync_settings_actions)
-        self.menu_bar.installEventFilter(self)
-        self.settings_menu.addSeparator()
-        pin_menu = self.settings_menu.addMenu('상단 메뉴바에 표시')
-        self.pin_actions = {}
-        try:
-            self.pinned_menu_items = load_menu_items()
-        except (OSError, ValueError):
-            self.pinned_menu_items = []
-            self.status.setText('상단 메뉴 설정을 읽지 못했습니다. 설정 메뉴에서 다시 선택하세요.')
-        for key, label in MENU_ITEMS.items():
-            action = pin_menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(key in self.pinned_menu_items)
-            action.toggled.connect(lambda checked, key=key: self.pin_menu_item(key, checked))
-            self.pin_actions[key] = action
-        self.refresh_pinned_menu()
-
-    def fill_choice_menu(self, menu, combo):
-        menu.clear()
-        group = QActionGroup(menu)
-        if hasattr(menu, 'choice_group'):
-            menu.choice_group.deleteLater()
-        menu.choice_group = group
-        for index in range(combo.count()):
-            action = menu.addAction(combo.itemText(index))
-            action.setCheckable(True)
-            group.addAction(action)
-            action.setChecked(index == combo.currentIndex())
-            action.setEnabled(combo.isEnabled())
-            action.triggered.connect(lambda checked, index=index: combo.setCurrentIndex(index) if combo.isEnabled() else None)
-
-    def fill_translation_menu(self, menu):
-        menu.clear()
-        for text, checked in [('말풍선 자동 감지', False), ('선택 영역 전체가 말풍선 하나', True)]:
-            action = menu.addAction(text)
-            action.setCheckable(True)
-            action.setChecked(self.manual.isChecked() == checked)
-            action.triggered.connect(lambda _, checked=checked: self.manual.setChecked(checked))
-
-    def sync_settings_actions(self):
-        self.menu_actions['apply'].setEnabled(self.device_apply.isEnabled())
-        self.menu_actions['hotkeys'].setEnabled(not self.hotkey_dialog_open)
-
-    def eventFilter(self, watched, event):
-        if (watched is getattr(self, 'menu_bar', None)
-                and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress, QEvent.Type.Enter)):
-            self.sync_settings_actions()
-        return super().eventFilter(watched, event)
-
-    def refresh_pinned_menu(self):
-        for action in self.menu_actions.values():
-            self.menu_bar.removeAction(action)
-        for key in MENU_ITEMS:
-            if key in self.pinned_menu_items:
-                self.menu_bar.addAction(self.menu_actions[key])
-
-    def pin_menu_item(self, key, checked):
-        if checked and key not in self.pinned_menu_items:
-            self.pinned_menu_items.append(key)
-        elif not checked and key in self.pinned_menu_items:
-            self.pinned_menu_items.remove(key)
-        self.refresh_pinned_menu()
-        try:
-            save_menu_items(self.pinned_menu_items)
-        except (OSError, ValueError):
-            self.status.setText('상단 메뉴 설정을 저장하지 못했습니다. 파일 쓰기 권한을 확인하세요.')
 
     def set_interface_mode(self, mode):
         if mode == self.interface_mode:
@@ -820,13 +693,6 @@ class Controller(QWidget):
             self.update_hotkey_note(errors)
         finally:
             self.hotkey_dialog_open = False
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        try:
-            allow_capture(self)
-        except OSError:
-            log.warning('Controller capture permission could not be reset.')
 
     def connect_engine(self):
         self.signals.status.connect(self.status.setText)
@@ -1094,21 +960,6 @@ class Controller(QWidget):
         self.engine.detector_size = self.detection_mode.currentData()
         self.reset_frame()
 
-    def configure_capture(self):
-        try:
-            allow_capture(self)
-            allow_capture(self.overlay)
-            self.control_excluded = True
-            self.overlay_excluded = True
-        except Exception as exc:
-            log.warning('Capture mode configuration failed: %s', exc)
-            self.running = False
-            self.toggle_button.setText('번역 시작')
-            self.status.setText(f'화면공유 설정 실패: {exc}')
-            return False
-        self.update_capture_mode()
-        return True
-
     def reset_frame(self, *_):
         self.capture.invalidate()
         if self.single_shot:
@@ -1159,17 +1010,12 @@ class Controller(QWidget):
             log.exception('Selected region lookup failed')
             self.status.setText(f'영역 좌표 조회 실패: {exc} — 영역을 다시 선택하세요.')
             return
-        if not self.configure_capture():
-            self.region = None
-            self.show()
-            return
-        log.info('Selected region=%s overlay_excluded=%s control_excluded=%s',
-                 self.region, self.overlay_excluded, self.control_excluded)
+        log.info('Selected region=%s', self.region)
+        self.update_capture_mode()
         if self.single_shot:
             self.capture_snapshot()
             return
         self.status.setText('영역 선택 완료 · 번역 시작을 누르세요.')
-        self.update_capture_mode()
         self.show()
 
     def retry_translation(self):
@@ -1223,8 +1069,6 @@ class Controller(QWidget):
         self.timer.setInterval(150)
         if self.single_shot:
             self.capture_note.setText('Manga Live 아래 창을 읽습니다. 드래그 번역은 화면 변경 후 다시 번역을 누르세요.')
-        elif not self.overlay_excluded:
-            self.capture_note.setText('선택 영역 안에서만 변화와 스크롤을 감지합니다. 가려진 내용만 바뀌면 다시 번역을 누르세요.')
         else:
             self.capture_note.setText('Manga Live 창을 제외하고 아래 화면의 변화를 감지합니다.')
 
@@ -1368,11 +1212,6 @@ def main():
         note.setWordWrap(True)
         window.layout().addWidget(note)
     window.show()
-    try:
-        allow_capture(window)
-        allow_capture(window.overlay)
-    except Exception as exc:
-        log.warning('Screen sharing configuration failed: %s', exc)
     return app.exec()
 
 

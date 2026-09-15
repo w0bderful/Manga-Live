@@ -51,14 +51,12 @@ def merge_row(rows, incoming):
     return [row for row in rows if not overlaps(row[0])] + [incoming]
 
 
-def scroll_offset(before, after, ignored=()):
+def scroll_offset(before, after):
 
     if before is None or after is None or before.shape != after.shape:
         return None
     height, width = before.shape[:2]
     mask = np.full((height, width), 255, np.uint8)
-    for b in ignored:
-        mask[max(0, b.y-14):max(0, b.y+b.h+14), max(0, b.x-14):max(0, b.x+b.w+14)] = 0
     old = cv2.cvtColor(before, cv2.COLOR_RGB2GRAY)
     new = cv2.cvtColor(after, cv2.COLOR_RGB2GRAY)
     shift, confidence = cv2.phaseCorrelate(old.astype(np.float32), new.astype(np.float32))
@@ -113,30 +111,12 @@ def move_rows(rows, offset, shape):
             if b.x < width and b.y < height and b.x+b.w > 0 and b.y+b.h > 0]
 
 
-def restore_occluded(before, captured, boxes, offset):
-
-    height, width = captured.shape[:2]
-    dx, dy = offset
-    shifted = cv2.warpAffine(before, np.float32([[1, 0, dx], [0, 1, dy]]),
-                             (width, height), borderValue=(255, 255, 255))
-    clean = captured.copy()
-    for b in boxes:
-        ys = slice(max(0, b.y-14), max(0, b.y+b.h+14))
-        xs = slice(max(0, b.x-14), max(0, b.x+b.w+14))
-        clean[ys, xs] = shifted[ys, xs]
-    return clean
-
-
-def changed(before, after, threshold=0.008, ignored=()):
+def changed(before, after, threshold=0.008):
     if before is None or before.shape != after.shape:
         return True
     delta = np.abs(before.astype(np.int16) - after.astype(np.int16))
     different = np.max(delta, axis=2) > 25
-    visible = np.ones(different.shape, dtype=bool)
-    for box in ignored:
-        visible[max(0, box.y-12):max(0, box.y+box.h+12),
-                max(0, box.x-12):max(0, box.x+box.w+12)] = False
-    return bool(visible.any() and float(np.mean(different[visible])) > threshold)
+    return bool(different.size and float(np.mean(different)) > threshold)
 
 
 def text_boxes(horizontal, free, width, height):
