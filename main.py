@@ -16,13 +16,14 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 
-from PIL import Image, ImageFilter
+from PIL import Image
 from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap, QAction, QActionGroup
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                             QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout,
-                            QMenuBar, QDialog, QScrollArea, QGridLayout)
+                            QMenuBar, QDialog, QScrollArea, QGridLayout, QSpinBox)
 from core import changed, relocate, merge_row, scroll_offset, move_rows
 from translation import (create_translation_client, TRANSLATION_MODES, validate_openai_settings,
                          list_openai_models, get_deepl_usage)
@@ -31,6 +32,7 @@ from api_settings import (load_api_key, save_api_keys, load_openai_settings, OPE
                           load_translation_provider)
 from window_capture import CaptureWithoutApp
 from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
+from overlay_settings import DEFAULT_OPACITY, load_opacity, save_opacity
 
 log = logging.getLogger(__name__)
 
@@ -219,6 +221,36 @@ class Engine(threading.Thread):
             self.signals.failed.emit(self, self.generation, f'모델 초기화 실패: {exc}\n의존성과 인터넷 연결을 확인한 뒤 재실행하세요.')
 
 
+def vertical_text_layout(text, rect):
+    characters = list(unicodedata.normalize('NFC', ' '.join(text.split())))
+    font = QFont('Malgun Gothic')
+    if not characters or rect.width() <= 0 or rect.height() <= 0:
+        return font, []
+    for size in range(23, 0, -1):
+        font.setPixelSize(size)
+        metrics = QFontMetricsF(font)
+        cell_width = max(metrics.height(), *(max(metrics.horizontalAdvance(char),
+                                                 metrics.boundingRect(char).width())
+                                             for char in characters))
+        cell_height = metrics.height()
+        rows = int(rect.height() // cell_height)
+        columns = int(rect.width() // cell_width)
+        if rows and columns and rows * columns >= len(characters):
+            break
+    else:
+        return font, []
+    used_columns = (len(characters) + rows - 1) // rows
+    right = rect.center().x() + used_columns * cell_width / 2
+    top = rect.center().y() - min(rows, len(characters)) * cell_height / 2
+    cells = []
+    for index, char in enumerate(characters):
+        column, row = divmod(index, rows)
+        cell = QRectF(right - (column + 1) * cell_width, top + row * cell_height,
+                      cell_width, cell_height)
+        cells.append((char, cell))
+    return font, cells
+
+
 class Overlay(QWidget):
     def __init__(self):
         super().__init__()
@@ -228,6 +260,8 @@ class Overlay(QWidget):
 
 
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.background_opacity = DEFAULT_OPACITY
         self.rows = []
         self.source_size = (1, 1)
         self.rendered = QImage()
@@ -239,35 +273,29 @@ class Overlay(QWidget):
         self.setMask(QRegion(-2, -2, 1, 1))
         self.update()
 
-    def display(self, rows, source_size, background=None):
+    def display(self, rows, source_size):
         self.rows = rows
         self.source_size = source_size
         layer = QImage(self.size(), QImage.Format.Format_RGBA8888)
         layer.fill(0)
         painter = QPainter(layer)
+        sx, sy = self.width() / source_size[0], self.height() / source_size[1]
+        background = QColor(255, 255, 255, round(255 * self.background_opacity / 100))
+        background_region = QRegion()
+        for box, text in rows:
+            if text.strip():
+                background_region |= QRegion(QRectF(box.x*sx, box.y*sy, box.w*sx, box.h*sy).toAlignedRect())
+        painter.save()
+        painter.setClipRegion(background_region)
+        painter.fillRect(layer.rect(), background)
+        painter.restore()
         self.paint_text(painter)
         painter.end()
 
 
-        glyphs = Image.frombytes('RGBA', (layer.width(), layer.height()),
-                                 layer.bits().asstring(layer.sizeInBytes()))
-        alpha = glyphs.getchannel('A')
-        halo = alpha.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.GaussianBlur(1.8))
-        halo = halo.point(lambda value: min(255, int(value * 1.8)))
-        if background is not None:
-            base = Image.fromarray(background).convert('RGBA').resize(glyphs.size, Image.Resampling.BILINEAR)
-        else:
-            base = Image.new('RGBA', glyphs.size, 'white')
-        glow = Image.new('RGBA', glyphs.size, 'white')
-        glow.putalpha(halo)
-        composed = Image.alpha_composite(Image.alpha_composite(base, glow), glyphs)
-
-
-        coverage = halo.point(lambda value: 255 if value >= 8 else 0)
-        composed.putalpha(coverage)
-        self.rendered = QImage(composed.tobytes(), composed.width, composed.height,
-                               QImage.Format.Format_RGBA8888).copy()
-        mask = QRegion(QBitmap.fromImage(self.rendered.createAlphaMask()))
+        self.rendered = layer
+        mask = (background_region if self.background_opacity else
+                QRegion(QBitmap.fromImage(self.rendered.createAlphaMask())))
         self.setMask(mask if not mask.isEmpty() else QRegion(-2, -2, 1, 1))
         self.show()
         self.update()
@@ -282,8 +310,20 @@ class Overlay(QWidget):
         flags = Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere
         for box, text in self.rows:
             rect = QRectF(box.x*sx, box.y*sy, box.w*sx, box.h*sy)
-            inner = rect.adjusted(2, 2, -2, -2)
+            padding = min(4, rect.width() / 4, rect.height() / 4)
+            inner = rect.adjusted(padding, padding, -padding, -padding)
             if inner.width() <= 0 or inner.height() <= 0:
+                continue
+
+            if box.h > box.w * 1.25:
+                font, cells = vertical_text_layout(text, inner)
+                painter.save()
+                painter.setClipRect(inner)
+                painter.setFont(font)
+                painter.setPen(QColor('#151515'))
+                for char, cell in cells:
+                    painter.drawText(cell, int(Qt.AlignmentFlag.AlignCenter), char)
+                painter.restore()
                 continue
 
             font = QFont('Malgun Gothic')
@@ -298,6 +338,27 @@ class Overlay(QWidget):
             painter.setClipRect(inner)
             painter.drawText(inner, int(flags), text)
             painter.restore()
+
+
+class RegionIndicator(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
+                            Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput |
+                            Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+    def show_region(self, area):
+        self.setGeometry(area.adjusted(-3, -3, 3, 3))
+        self.setMask(QRegion(self.rect()) - QRegion(self.rect().adjusted(3, 3, -3, -3)))
+        self.show()
+        self.raise_()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('#00d7ff'))
+        painter.setPen(QPen(QColor('#151515'), 1))
+        painter.drawRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5))
 
 
 class Selector(QWidget):
@@ -357,6 +418,13 @@ class Controller(QWidget):
         self.setAutoFillBackground(True)
         self.resize(510, 230)
         self.overlay = Overlay()
+        self.region_indicator = RegionIndicator()
+        opacity_error = ''
+        try:
+            self.overlay.background_opacity = load_opacity()
+        except (OSError, ValueError):
+            opacity_error = '배경 설정을 읽지 못해 기본값을 사용합니다. 값을 변경하면 다시 저장합니다.'
+            log.warning('Overlay settings could not be loaded', exc_info=True)
         self.capture = CaptureWithoutApp()
         self.region = None
         self.reference = None
@@ -522,10 +590,6 @@ class Controller(QWidget):
         self.models_timer.timeout.connect(self.finish_model_list)
         self.openai_base_url.textChanged.connect(self.invalidate_model_list)
         self.openai_api_key.textChanged.connect(self.invalidate_model_list)
-        openai_note = QLabel('Chat Completions 호환 서버 · 주소·키·모델은 자동 저장됩니다.\n'
-                            '변경한 설정은 위의 설정 적용 버튼을 눌러 사용하세요.')
-        openai_note.setWordWrap(True)
-        openai_form.addRow(openai_note)
         layout.addWidget(self.openai_panel)
         self.openai_panel.setVisible(initial_provider == 'openai')
         self.api_settings_note = QLabel('API 키 파일을 읽지 못했습니다. 키를 다시 입력하고 설정을 적용하세요. '
@@ -571,6 +635,21 @@ class Controller(QWidget):
         self.detection_mode.addItem('정밀 감지 (작은 글씨 · 느림)', 1920)
         self.detection_mode.currentIndexChanged.connect(self.change_detection_mode)
         layout.addWidget(self.detection_mode)
+        self.background_settings_panel = QWidget()
+        background_form = QFormLayout(self.background_settings_panel)
+        background_form.setContentsMargins(0, 0, 0, 0)
+        self.background_opacity = QSpinBox()
+        self.background_opacity.setRange(0, 100)
+        self.background_opacity.setSuffix(' %')
+        self.background_opacity.setValue(self.overlay.background_opacity)
+        self.background_opacity.setToolTip('0%: 배경 없음 · 100%: 완전히 불투명한 흰색 배경')
+        background_form.addRow('텍스트 배경 불투명도', self.background_opacity)
+        self.background_settings_note = QLabel(opacity_error)
+        self.background_settings_note.setWordWrap(True)
+        self.background_settings_note.setVisible(bool(opacity_error))
+        background_form.addRow(self.background_settings_note)
+        self.background_opacity.valueChanged.connect(self.change_background_opacity)
+        layout.addWidget(self.background_settings_panel)
         self.status = QLabel('준비 중…')
         self.status.setWordWrap(True)
         self.main_layout.addWidget(self.status)
@@ -621,17 +700,42 @@ class Controller(QWidget):
             if scroll.widget() is self.settings_panel:
                 scroll.takeWidget()
         advanced = mode == 'advanced'
+        settings_layout = self.settings_panel.layout()
+        self.main_layout.removeWidget(self.deepl_usage_panel)
+        settings_layout.removeWidget(self.deepl_usage_panel)
+        if advanced:
+            settings_layout.insertWidget(settings_layout.indexOf(self.deepl_api_key) + 1,
+                                         self.deepl_usage_panel)
+        else:
+            self.main_layout.insertWidget(self.main_layout.indexOf(self.action_panel),
+                                          self.deepl_usage_panel)
+        self.deepl_usage_panel.setVisible(self.translation_mode.currentData() == 'deepl')
         target = self.inline_settings if advanced else self.dialog_settings
         target.setWidget(self.settings_panel)
         self.settings_panel.show()
         self.inline_settings.setVisible(advanced)
         self.capture_note.setVisible(advanced)
+        self.background_settings_panel.setVisible(advanced)
         self.interface_mode = mode
         self.basic_mode_action.setChecked(not advanced)
         self.advanced_mode_action.setChecked(advanced)
         self.main_layout.activate()
         available = self.screen().availableGeometry()
         self.resize(560 if advanced else 510, min(850, available.height() - 80) if advanced else self.minimumSizeHint().height())
+
+    def change_background_opacity(self, value):
+        self.overlay.background_opacity = value
+        try:
+            save_opacity(value)
+        except (OSError, ValueError):
+            self.background_settings_note.setText('배경 설정을 저장하지 못했습니다. 파일 쓰기 권한을 확인하세요.')
+            self.background_settings_note.show()
+            log.warning('Overlay settings could not be saved', exc_info=True)
+        else:
+            self.background_settings_note.clear()
+            self.background_settings_note.hide()
+        if self.overlay.rows:
+            self.overlay.display(self.overlay.rows, self.overlay.source_size)
 
     def open_settings(self):
         if self.inline_settings.widget() is self.settings_panel:
@@ -975,6 +1079,7 @@ class Controller(QWidget):
         self.overlay.clear()
 
     def select_region(self, single_shot=False):
+        self.region_indicator.hide()
         self.settings_dialog.close()
         self.running = False
         self.toggle_button.setText('번역 시작')
@@ -989,11 +1094,13 @@ class Controller(QWidget):
         self.selector.activateWindow()
 
     def cancel_selection(self):
+        self.region_indicator.hide()
         self.single_shot = False
         self.status.setText('영역 선택을 취소했습니다.')
         self.show()
 
     def set_region(self, area):
+        self.region_indicator.hide()
         self.region = None
         self.overlay.setGeometry(area)
         self.overlay.show()
@@ -1011,6 +1118,7 @@ class Controller(QWidget):
             self.status.setText(f'영역 좌표 조회 실패: {exc} — 영역을 다시 선택하세요.')
             return
         log.info('Selected region=%s', self.region)
+        self.region_indicator.show_region(area)
         self.update_capture_mode()
         if self.single_shot:
             self.capture_snapshot()
@@ -1120,7 +1228,7 @@ class Controller(QWidget):
                         moved = relocate(box, previous, pixels)
                         if moved is not None:
                             tracked.append((moved, text))
-                self.overlay.display(tracked, (pixels.shape[1], pixels.shape[0]), pixels)
+                self.overlay.display(tracked, (pixels.shape[1], pixels.shape[0]))
             self.submit_pending_frame()
         except Exception as exc:
             self.running = False
@@ -1146,7 +1254,7 @@ class Controller(QWidget):
             if moved is not None:
                 combined = merge_row(combined, (moved, text))
         if combined:
-            self.overlay.display(combined, (self.latest.shape[1], self.latest.shape[0]), self.latest)
+            self.overlay.display(combined, (self.latest.shape[1], self.latest.shape[0]))
             self.status.setText(f'{len(combined)}개 영역 번역 표시 중 · 나머지 처리 중')
 
     def frame_finished(self, generation):
@@ -1181,6 +1289,7 @@ class Controller(QWidget):
         self.engine.stop_event.set()
         self.engine.generation += 1
         self.overlay.close()
+        self.region_indicator.close()
         if hasattr(self, 'selector'):
             self.selector.close()
         self.capture.close()
