@@ -6,7 +6,4 @@ __pycache__/
 .env
 .env.*
 api-keys.json
-api-keys.json.tmp
-kie-api-key.json
-deepl-api-key.json
 시작방법.txt
