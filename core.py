@@ -140,7 +140,6 @@ def changed(before, after, threshold=0.008, ignored=()):
 
 
 def text_boxes(horizontal, free, width, height):
-
     raw = [(b[0], b[2], b[1], b[3]) for b in horizontal]
     for poly in free:
         points = np.asarray(poly)
