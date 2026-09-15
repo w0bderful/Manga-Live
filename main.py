@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 from PIL import Image, ImageFilter
-from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QEvent
 from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap, QAction, QActionGroup
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                             QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout,
@@ -33,6 +33,7 @@ from api_settings import (load_api_key, save_api_keys, load_openai_settings, OPE
                           load_translation_provider)
 from window_capture import CaptureWithoutApp
 from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
+from ui_settings import MENU_ITEMS, load_menu_items, save_menu_items
 
 log = logging.getLogger(__name__)
 
@@ -423,8 +424,8 @@ class Controller(QWidget):
         self.menu_bar = QMenuBar(self)
         self.menu_bar.setNativeMenuBar(False)
         layout.setMenuBar(self.menu_bar)
-        settings_menu = self.menu_bar.addMenu('설정')
-        self.open_settings_action = settings_menu.addAction('설정 열기…')
+        self.settings_menu = settings_menu = self.menu_bar.addMenu('설정')
+        self.open_settings_action = settings_menu.addAction('설정 창 따로 열기')
         self.open_settings_action.setShortcut('Ctrl+,')
         self.open_settings_action.triggered.connect(self.open_settings)
         settings_menu.addSeparator()
@@ -641,6 +642,7 @@ class Controller(QWidget):
         layout.addStretch()
         self.settings_dialog = QDialog(self)
         self.settings_dialog.setWindowTitle('Manga Live 설정')
+        self.settings_dialog.finished.connect(self.restore_inline_settings)
         dialog_layout = QVBoxLayout(self.settings_dialog)
         self.dialog_settings = QScrollArea()
         self.dialog_settings.setWidgetResizable(True)
@@ -650,7 +652,93 @@ class Controller(QWidget):
         dialog_layout.addWidget(close_settings)
         self.interface_mode = None
         self.set_interface_mode('basic')
+        self.configure_settings_menu()
         self.engine.start()
+
+    def configure_settings_menu(self):
+        self.menu_actions = {'basic': self.basic_mode_action, 'advanced': self.advanced_mode_action,
+                             'window': self.open_settings_action}
+        self.settings_menu.addSeparator()
+        for key, combo in [('monitor', self.screens), ('provider', self.translation_mode),
+                           ('device', self.device_mode), ('ocr', self.ocr_mode),
+                           ('resolution', self.detection_mode)]:
+            menu = self.settings_menu.addMenu(MENU_ITEMS[key])
+            menu.aboutToShow.connect(lambda menu=menu, combo=combo: self.fill_choice_menu(menu, combo))
+            self.menu_actions[key] = menu.menuAction()
+        translation_menu = self.settings_menu.addMenu(MENU_ITEMS['translation'])
+        translation_menu.aboutToShow.connect(lambda: self.fill_translation_menu(translation_menu))
+        self.menu_actions['translation'] = translation_menu.menuAction()
+        for key, callback in [('hotkeys', self.configure_hotkeys), ('apply', self.change_device)]:
+            action = self.settings_menu.addAction(MENU_ITEMS[key])
+            action.triggered.connect(callback)
+            self.menu_actions[key] = action
+        self.settings_menu.aboutToShow.connect(self.sync_settings_actions)
+        self.menu_bar.installEventFilter(self)
+        self.settings_menu.addSeparator()
+        pin_menu = self.settings_menu.addMenu('상단 메뉴바에 표시')
+        self.pin_actions = {}
+        try:
+            self.pinned_menu_items = load_menu_items()
+        except (OSError, ValueError):
+            self.pinned_menu_items = []
+            self.status.setText('상단 메뉴 설정을 읽지 못했습니다. 설정 메뉴에서 다시 선택하세요.')
+        for key, label in MENU_ITEMS.items():
+            action = pin_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(key in self.pinned_menu_items)
+            action.toggled.connect(lambda checked, key=key: self.pin_menu_item(key, checked))
+            self.pin_actions[key] = action
+        self.refresh_pinned_menu()
+
+    def fill_choice_menu(self, menu, combo):
+        menu.clear()
+        group = QActionGroup(menu)
+        if hasattr(menu, 'choice_group'):
+            menu.choice_group.deleteLater()
+        menu.choice_group = group
+        for index in range(combo.count()):
+            action = menu.addAction(combo.itemText(index))
+            action.setCheckable(True)
+            group.addAction(action)
+            action.setChecked(index == combo.currentIndex())
+            action.setEnabled(combo.isEnabled())
+            action.triggered.connect(lambda checked, index=index: combo.setCurrentIndex(index) if combo.isEnabled() else None)
+
+    def fill_translation_menu(self, menu):
+        menu.clear()
+        for text, checked in [('말풍선 자동 감지', False), ('선택 영역 전체가 말풍선 하나', True)]:
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(self.manual.isChecked() == checked)
+            action.triggered.connect(lambda _, checked=checked: self.manual.setChecked(checked))
+
+    def sync_settings_actions(self):
+        self.menu_actions['apply'].setEnabled(self.device_apply.isEnabled())
+        self.menu_actions['hotkeys'].setEnabled(not self.hotkey_dialog_open)
+
+    def eventFilter(self, watched, event):
+        if (watched is getattr(self, 'menu_bar', None)
+                and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress, QEvent.Type.Enter)):
+            self.sync_settings_actions()
+        return super().eventFilter(watched, event)
+
+    def refresh_pinned_menu(self):
+        for action in self.menu_actions.values():
+            self.menu_bar.removeAction(action)
+        for key in MENU_ITEMS:
+            if key in self.pinned_menu_items:
+                self.menu_bar.addAction(self.menu_actions[key])
+
+    def pin_menu_item(self, key, checked):
+        if checked and key not in self.pinned_menu_items:
+            self.pinned_menu_items.append(key)
+        elif not checked and key in self.pinned_menu_items:
+            self.pinned_menu_items.remove(key)
+        self.refresh_pinned_menu()
+        try:
+            save_menu_items(self.pinned_menu_items)
+        except (OSError, ValueError):
+            self.status.setText('상단 메뉴 설정을 저장하지 못했습니다. 파일 쓰기 권한을 확인하세요.')
 
     def set_interface_mode(self, mode):
         if mode == self.interface_mode:
@@ -668,21 +756,31 @@ class Controller(QWidget):
         self.interface_mode = mode
         self.basic_mode_action.setChecked(not advanced)
         self.advanced_mode_action.setChecked(advanced)
-        self.open_settings_action.setText('설정으로 이동' if advanced else '설정 열기…')
         self.main_layout.activate()
         available = self.screen().availableGeometry()
         self.resize(560 if advanced else 510, min(850, available.height() - 80) if advanced else self.minimumSizeHint().height())
 
     def open_settings(self):
-        if self.interface_mode == 'advanced':
-            self.inline_settings.ensureWidgetVisible(self.screens)
-            self.screens.setFocus()
-            return
+        if self.inline_settings.widget() is self.settings_panel:
+            self.inline_settings.takeWidget()
+            self.dialog_settings.setWidget(self.settings_panel)
+            self.inline_settings.hide()
+            self.settings_panel.show()
+            self.main_layout.activate()
+            self.resize(self.width(), self.minimumSizeHint().height())
         available = self.screen().availableGeometry()
         self.settings_dialog.resize(560, min(760, available.height() - 80))
         self.settings_dialog.show()
         self.settings_dialog.raise_()
         self.settings_dialog.activateWindow()
+
+    def restore_inline_settings(self):
+        if self.interface_mode == 'advanced' and self.dialog_settings.widget() is self.settings_panel:
+            self.dialog_settings.takeWidget()
+            self.inline_settings.setWidget(self.settings_panel)
+            self.inline_settings.show()
+            self.settings_panel.show()
+            self.resize(560, min(850, self.screen().availableGeometry().height() - 80))
 
     def update_hotkey_note(self, errors=()):
         buttons = {'select': self.select_button, 'drag': self.drag_button,
@@ -1026,7 +1124,7 @@ class Controller(QWidget):
         self.overlay.clear()
 
     def select_region(self, single_shot=False):
-        self.settings_dialog.hide()
+        self.settings_dialog.close()
         self.running = False
         self.toggle_button.setText('번역 시작')
         self.reset_frame()

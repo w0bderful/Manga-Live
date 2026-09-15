@@ -15,3 +15,5 @@ __pycache__/
 /hotkeys.json.tmp
 
 /tests/
+/ui-settings.json
+/ui-settings.json.tmp
