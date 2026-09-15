@@ -1,10 +1,13 @@
 import json
 import os
 from pathlib import Path
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
 API_KEYS_FILE = ROOT / 'api-keys.json'
-FIELDS = {'luna': ('kie_api_key', 'KIE_API_KEY'), 'deepl': ('deepl_api_key', 'DEEPL_API_KEY')}
+FIELDS = {'luna': ('kie_api_key', 'KIE_API_KEY'), 'deepl': ('deepl_api_key', 'DEEPL_API_KEY'),
+          'openai': ('openai_api_key', 'OPENAI_API_KEY')}
+OPENAI_DEFAULTS = {'base_url': 'https://api.openai.com/v1', 'model': ''}
 LEGACY_FILES = {'kie_api_key': ROOT / 'kie-api-key.json',
                 'deepl_api_key': ROOT / 'deepl-api-key.json'}
 
@@ -24,16 +27,41 @@ def write_keys(data):
     temporary.replace(API_KEYS_FILE)
 
 
-def migrate_keys():
-    data = read_keys(API_KEYS_FILE)
+def read_key_file(path, fields, recover=False, required=False):
+    if not path.exists():
+        return {}
+    data = {}
+    try:
+        data = read_keys(path)
+        if any((required or field in data) and not isinstance(data.get(field), str)
+               for field in fields):
+            raise ValueError('API 키는 문자열이어야 합니다.')
+        return data
+    except (ValueError, UnicodeError):
+        if not recover:
+            raise
+        backup_dir = path.parent / 'api-key-backups'
+        backup_dir.mkdir(exist_ok=True)
+        backup = backup_dir / f'{path.stem}-{uuid4().hex}{path.suffix}'
+        path.replace(backup)
+        return {key: value for key, value in data.items()
+                if key not in fields or isinstance(value, str)}
+
+
+def migrate_keys(recover=False, provider=None):
+    data = (read_key_file(API_KEYS_FILE, [field for field, _ in FIELDS.values()] +
+                          ['openai_base_url', 'openai_model', 'translation_provider'], recover=True)
+            if recover else read_keys(API_KEYS_FILE))
     migrated = []
-    for field, env_name in FIELDS.values():
-        legacy = LEGACY_FILES[field]
-        if not legacy.exists():
+    for service, (field, env_name) in FIELDS.items():
+        if provider is not None and service != provider:
             continue
-        old_value = read_keys(legacy).get(env_name)
-        if not isinstance(old_value, str):
-            raise ValueError('기존 API 키 파일의 키 형식이 잘못되었습니다.')
+        legacy = LEGACY_FILES.get(field)
+        if legacy is None or not legacy.exists():
+            continue
+        old_value = read_key_file(legacy, [env_name], recover, required=True).get(env_name)
+        if old_value is None:
+            continue
         if field not in data:
             data[field] = old_value.strip()
         migrated.append(legacy)
@@ -48,14 +76,41 @@ def migrate_keys():
 
 def load_api_key(provider='luna'):
     field, env_name = FIELDS[provider]
-    data = migrate_keys()
+    data = read_keys(API_KEYS_FILE)
+    if field not in data:
+        data = migrate_keys(provider=provider)
     value = data.get(field, os.environ.get(env_name, ''))
     if not isinstance(value, str):
         raise ValueError('API 키는 문자열이어야 합니다.')
     return value.strip()
 
 
-def save_api_keys(kie_key, deepl_key):
-    data = migrate_keys()
+def load_openai_settings():
+    data = read_keys(API_KEYS_FILE)
+    result = {}
+    for name, default in OPENAI_DEFAULTS.items():
+        value = data.get('openai_' + name, default)
+        if not isinstance(value, str):
+            raise ValueError('OpenAI 호환 API 주소와 모델은 문자열이어야 합니다.')
+        result[name] = value.strip()
+    return result
+
+
+def load_translation_provider():
+    provider = read_keys(API_KEYS_FILE).get('translation_provider', 'luna')
+    return provider if isinstance(provider, str) and provider in FIELDS else 'luna'
+
+
+def save_api_keys(kie_key, deepl_key, *, openai_key=None, openai_base_url=None, openai_model=None,
+                  translation_provider=None):
+    if translation_provider is not None and translation_provider not in FIELDS:
+        raise ValueError('지원하지 않는 번역 서비스입니다.')
+    data = migrate_keys(recover=True)
     data.update(kie_api_key=kie_key.strip(), deepl_api_key=deepl_key.strip())
+    for field, value in [('openai_api_key', openai_key), ('openai_base_url', openai_base_url),
+                         ('openai_model', openai_model)]:
+        if value is not None:
+            data[field] = value.strip()
+    if translation_provider is not None:
+        data['translation_provider'] = translation_provider
     write_keys(data)

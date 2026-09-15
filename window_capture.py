@@ -1,9 +1,7 @@
 import ctypes
 from ctypes import wintypes as w
-from concurrent.futures import Future
+import multiprocessing
 import os
-import queue
-import threading
 import time
 
 import mss
@@ -25,7 +23,8 @@ class BitmapInfo(ctypes.Structure):
 
 
 class NativeWindows:
-    def __init__(self):
+    def __init__(self, owner_pid=None):
+        self.owner_pid = os.getpid() if owner_pid is None else owner_pid
         self.user = u = ctypes.WinDLL('user32', use_last_error=True)
         self.gdi = g = ctypes.WinDLL('gdi32', use_last_error=True)
         self.dwm = ctypes.WinDLL('dwmapi')
@@ -68,7 +67,7 @@ class NativeWindows:
                 return True
             box = (rect.left, rect.top, rect.right, rect.bottom)
             self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            own = pid.value == os.getpid()
+            own = pid.value == self.owner_pid
             if own:
                 region = self.gdi.CreateRectRgn(0, 0, 0, 0)
                 try:
@@ -141,26 +140,17 @@ def restore_under_windows(pixels, bounds, layers, render):
     raise RuntimeError('Manga Live 아래에서 읽을 수 있는 창을 찾지 못했습니다.')
 
 
-class CaptureWithoutApp:
-    def __init__(self):
-        self.jobs = queue.Queue(maxsize=1)
-        self.pending = None
-        self.closed = False
-        self.version = 0
-        self.thread = threading.Thread(target=self.run, daemon=True, name='window-capture')
-        self.thread.start()
-
-    def run(self):
+def capture_worker(connection, owner_pid):
+    try:
         user = ctypes.WinDLL('user32')
         user.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
         user.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
-        native = NativeWindows()
+        native = NativeWindows(owner_pid)
         with mss.MSS() as screen:
             while True:
-                job = self.jobs.get()
-                if job is None or self.closed:
+                region = connection.recv()
+                if region is None:
                     return
-                region, future = job
                 try:
                     x, y, width, height = (region[k] for k in ('left', 'top', 'width', 'height'))
                     bounds = (x, y, x+width, y+height)
@@ -173,35 +163,90 @@ class CaptureWithoutApp:
                         except ScreenShotError:
                             pixels = np.zeros((height, width, 3), dtype=np.uint8)
                             layers.insert(0, (0, bounds, True))
-                    future.set_result(restore_under_windows(pixels, bounds, layers, native.render))
+                    connection.send((True, restore_under_windows(pixels, bounds, layers, native.render)))
                 except Exception as exc:
-                    future.set_exception(exc)
-                if self.closed:
-                    return
+                    connection.send((False, str(exc)))
+    except (EOFError, BrokenPipeError):
+        pass
+    except Exception as exc:
+        try:
+            connection.send((False, f'캡처 초기화 실패: {exc}'))
+        except (OSError, EOFError):
+            pass
+    finally:
+        connection.close()
+
+
+class CaptureWithoutApp:
+    def __init__(self):
+        self.pending = None
+        self.closed = False
+        self.version = 0
+        self.process = None
+        self.connection = None
+
+    def start_worker(self):
+        context = multiprocessing.get_context('spawn')
+        parent, child = context.Pipe()
+        process = context.Process(target=capture_worker, args=(child, os.getpid()),
+                                  daemon=True, name='window-capture')
+        try:
+            process.start()
+        except Exception:
+            parent.close()
+            raise
+        finally:
+            child.close()
+        self.connection, self.process = parent, process
+
+    def stop_worker(self):
+        self.pending = None
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        if self.process is not None:
+            # PrintWindow can block indefinitely; a separate process can be stopped safely.
+            if self.process.is_alive():
+                self.process.terminate()
+            self.process.join(timeout=0.2)
+            if not self.process.is_alive():
+                self.process.close()
+            self.process = None
 
     def grab(self, region):
         if self.closed:
             return None
-        if self.pending is not None:
-            previous, future, started, version = self.pending
-            if not future.done():
-                if time.monotonic()-started > 5:
-                    raise RuntimeError('아래 창의 캡처 응답이 지연됩니다. 대상 앱 상태를 확인하세요.')
-                return None
-            self.pending = None
-            if previous == region and version == self.version:
-                return future.result()
-        future = Future()
-        self.pending = (dict(region), future, time.monotonic(), self.version)
-        self.jobs.put((dict(region), future))
-        return None
+        try:
+            if self.pending is not None:
+                previous, started, version = self.pending
+                if previous != region or version != self.version:
+                    self.stop_worker()
+                elif self.connection.poll():
+                    success, result = self.connection.recv()
+                    self.pending = None
+                    if not success:
+                        raise RuntimeError(result)
+                    return result
+                elif not self.process.is_alive():
+                    raise RuntimeError('캡처 작업이 종료되었습니다. 다시 번역을 눌러 재시도하세요.')
+                elif time.monotonic()-started > 5:
+                    raise RuntimeError('아래 창의 캡처 응답이 지연됩니다. 대상 앱을 확인하고 다시 번역을 누르세요.')
+                else:
+                    return None
+            if self.process is None:
+                self.start_worker()
+            self.connection.send(dict(region))
+            self.pending = (dict(region), time.monotonic(), self.version)
+            return None
+        except Exception:
+            self.stop_worker()
+            raise
 
     def invalidate(self):
         self.version += 1
+        if self.pending is not None:
+            self.stop_worker()
 
     def close(self):
         self.closed = True
-        try:
-            self.jobs.put_nowait(None)
-        except queue.Full:
-            pass
+        self.stop_worker()

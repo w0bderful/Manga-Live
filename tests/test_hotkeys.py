@@ -155,6 +155,8 @@ class HotkeyTests(unittest.TestCase):
         with patch.object(main.Engine, 'start'), \
                 patch.object(main, 'CaptureWithoutApp'), \
                 patch.object(main, 'load_api_key', return_value=''), \
+                patch.object(main, 'load_openai_settings', return_value=dict(main.OPENAI_DEFAULTS)), \
+                patch.object(main, 'load_translation_provider', return_value='luna'), \
                 patch.object(main, 'load_settings', return_value=dict(hotkeys.DEFAULTS)), \
                 patch.object(main, 'WindowsHotkeys', return_value=self.manager), \
                 patch.object(main, 'allow_capture'):
