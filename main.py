@@ -28,6 +28,7 @@ from translation import create_translation_client, TRANSLATION_MODES
 from ocr_backends import OcrBackend, MODES, validate_device
 from api_settings import load_api_key, save_api_keys
 from window_capture import CaptureWithoutApp
+from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
 
 log = logging.getLogger(__name__)
 
@@ -423,6 +424,9 @@ class Controller(QWidget):
         self.retry_button.clicked.connect(self.retry_translation)
         row.addWidget(self.retry_button)
         layout.addLayout(row)
+        self.hotkey_button = QPushButton('단축키 설정')
+        self.hotkey_button.clicked.connect(self.configure_hotkeys)
+        layout.addWidget(self.hotkey_button)
         self.manual = QCheckBox('선택 영역 전체가 말풍선 하나 (자동 감지 생략)')
         self.manual.toggled.connect(self.reset_frame)
         layout.addWidget(self.manual)
@@ -448,7 +452,58 @@ class Controller(QWidget):
         self.timer.setInterval(150)
         self.timer.timeout.connect(self.tick)
         self.timer.start()
+        self.hotkey_dialog_open = False
+        self.hotkeys = WindowsHotkeys(self.activate_hotkey)
+        try:
+            self.hotkey_settings = load_settings()
+            hotkey_errors = []
+        except (OSError, ValueError) as exc:
+            self.hotkey_settings = {action: '' for action in ACTIONS}
+            hotkey_errors = [f'저장된 단축키를 읽지 못했습니다. 단축키 설정에서 다시 저장하세요: {exc}']
+        hotkey_errors.extend(self.hotkeys.apply(self.hotkey_settings))
+        self.hotkey_note = QLabel()
+        self.hotkey_note.setWordWrap(True)
+        layout.addWidget(self.hotkey_note)
+        self.update_hotkey_note(hotkey_errors)
         self.engine.start()
+
+    def update_hotkey_note(self, errors=()):
+        buttons = {'select': self.select_button, 'drag': self.drag_button,
+                   'toggle': self.toggle_button, 'retry': self.retry_button}
+        active = set(self.hotkeys.active.values())
+        labels = []
+        for action, button in buttons.items():
+            key = self.hotkey_settings[action] if action in active else '미지정/비활성'
+            button.setToolTip(f'{ACTIONS[action]}: {key}')
+            labels.append(f'{ACTIONS[action]}: {key}')
+        self.hotkey_note.setText('\n'.join(errors) if errors else ' · '.join(labels))
+
+    def activate_hotkey(self, action):
+        if self.hotkey_dialog_open or (hasattr(self, 'selector') and self.selector.isVisible()):
+            return
+        if hasattr(self, 'device_timer') and self.device_timer.isActive():
+            self.status.setText('설정 적용이 끝난 뒤 단축키를 사용하세요.')
+            return
+        actions = {'select': self.select_region,
+                   'drag': lambda: self.select_region(single_shot=True),
+                   'toggle': self.toggle, 'retry': self.retry_translation}
+        actions[action]()
+
+    def configure_hotkeys(self):
+        if self.hotkey_dialog_open:
+            return
+        self.hotkey_dialog_open = True
+        self.hotkeys.clear()
+        try:
+            dialog = HotkeyDialog(self, self.hotkeys, self.hotkey_settings)
+            if dialog.exec():
+                self.hotkey_settings = dialog.settings
+                errors = []
+            else:
+                errors = self.hotkeys.apply(self.hotkey_settings)
+            self.update_hotkey_note(errors)
+        finally:
+            self.hotkey_dialog_open = False
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -786,6 +841,7 @@ class Controller(QWidget):
                 self.status.setText(f'{len(self.overlay.rows)}개 영역 표시 · 화면 변화 대기 중')
 
     def closeEvent(self, event):
+        self.hotkeys.close()
         if self.api_key_save_timer.isActive():
             self.save_api_key()
         if hasattr(self, 'device_timer'):
