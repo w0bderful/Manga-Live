@@ -555,7 +555,7 @@ class OcrBackend:
             if self.status:
                 self.status('언어 판별 실패 · Manga OCR로 인식 시도 중…')
         elif self.source_language == 'auto' and self.status:
-            self.status('일본어 감지 · Manga OCR 인식 중…' if language == 'ja' else '영어 감지 · TrOCR → EasyOCR 인식 중…')
+            self.status('일본어 감지 · Manga OCR 인식 중…' if language == 'ja' else '영어 감지 · 글씨체 확인 중…')
         pixels = prepare_ocr_image(np.asarray(crop.convert('RGB')))
         if language == 'en':
             reader = self.english_reader
@@ -569,7 +569,9 @@ class OcrBackend:
 
     def read_english(self, pixels, reader):
         from easyocr.utils import get_paragraph
-        from handwriting_ocr import crop_text_line, usable_handwriting
+        from handwriting_ocr import crop_text_line, usable_handwriting, classify_text_style
+        if self.status:
+            self.status('영어 글씨체 확인 중…')
         horizontal, free = reader.detect(pixels, min_size=5, text_threshold=.55,
             low_text=.25, link_threshold=.3, add_margin=.05)
         polygons = [[[x1,y1],[x2,y1],[x2,y2],[x1,y2]] for x1,x2,y1,y2 in horizontal[0]] + list(free[0])
@@ -578,12 +580,37 @@ class OcrBackend:
             line = crop_text_line(pixels, polygon)
             if line is None:
                 continue
-            # Only uncertain/failed TrOCR readings invoke the EasyOCR recognizer.
-            candidate = self.read_handwriting(line)
-            if usable_handwriting(candidate):
-                text = candidate
+            style = classify_text_style(line)
+            if self.status:
+                label = {'printed': '인쇄체 추정 · EasyOCR',
+                         'handwritten': '손글씨·장식체 추정 · TrOCR',
+                         'unknown': '글씨체 불확실 · TrOCR'}[style]
+                self.status('TrOCR를 사용할 수 없어 EasyOCR 결과로 계속합니다.'
+                            if self.handwriting_failed else f'영어 {label} 인식 중…')
+            if style == 'printed':
+                # Require the recognizer's confidence as well as regular shapes.
+                # A handwritten/decorative line can also have a regular baseline.
+                try:
+                    rows = reader.recognize(np.asarray(line), detail=1, paragraph=False)
+                    text = ' '.join(row[1].strip() for row in rows if row[1].strip())
+                    reliable = bool(text) and all(np.isfinite(row[2]) and row[2] >= .8 for row in rows)
+                except Exception as exc:
+                    log.warning('Printed English recognition failed; trying TrOCR (%s)', type(exc).__name__)
+                    text, reliable = '', False
+                if not reliable:
+                    if self.status and not self.handwriting_failed:
+                        self.status('영어 인쇄체 인식 불확실 · TrOCR로 다시 인식 중…')
+                    candidate = self.read_handwriting(line)
+                    if usable_handwriting(candidate):
+                        text = candidate
             else:
-                text = ' '.join(reader.recognize(np.asarray(line), detail=0, paragraph=False)).strip()
+                candidate = self.read_handwriting(line)
+                if usable_handwriting(candidate):
+                    text = candidate
+                else:
+                    if self.status and not self.handwriting_failed:
+                        self.status('영어 TrOCR 인식 불확실 · EasyOCR로 다시 인식 중…')
+                    text = ' '.join(reader.recognize(np.asarray(line), detail=0, paragraph=False)).strip()
             if text:
                 lines.append((polygon, text, 1.0))
         return ' '.join(row[1] for row in get_paragraph(lines, mode='ltr')).strip()

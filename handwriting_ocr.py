@@ -5,6 +5,50 @@ import re
 MODEL_ID = 'microsoft/trocr-small-handwritten'
 
 
+def classify_text_style(image):
+    """Conservative line-shape heuristic, not font identification or a classifier model."""
+    import cv2
+    import numpy as np
+
+    try:
+        gray = np.asarray(image.convert('L'))
+        if min(gray.shape) < 8 or float(gray.std()) < 8:
+            return 'unknown'
+        _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        if np.count_nonzero(ink) > ink.size / 2:
+            ink = cv2.bitwise_not(ink)
+        _, _, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+        parts = stats[1:]
+        parts = parts[(parts[:, 4] >= 5) & (parts[:, 3] >= 4)]
+        if len(parts) < 6:
+            return 'unknown'
+        reference = float(np.percentile(parts[:, 3], 90))
+        parts = parts[(parts[:, 3] >= .5 * reference) & (parts[:, 2] <= 2 * reference)]
+        if not 6 <= len(parts) <= 160 or reference < 10:
+            return 'unknown'
+        height = float(np.median(parts[:, 3]))
+        x = parts[:, 0] + parts[:, 2] / 2
+        bottom = parts[:, 1] + parts[:, 3]
+        dx = x[:, None] - x
+        dy = bottom[:, None] - bottom
+        separated = np.abs(dx) > 2 * height
+        if not np.any(separated):
+            return 'unknown'
+        slope = float(np.median(dy[separated] / dx[separated]))
+        if abs(slope) > .35:
+            return 'unknown'
+        baseline = bottom - slope * x
+        aligned = float(np.max(np.mean(np.abs(baseline[:, None] - baseline) <= max(1, .08 * height), axis=1)))
+        variation = float(np.ptp(np.percentile(parts[:, 3], [10, 90])) / height)
+        if aligned >= .85 and variation <= .5:
+            return 'printed'
+        if aligned < .65 and variation > .3:
+            return 'handwritten'
+        return 'unknown'
+    except (cv2.error, ValueError, TypeError):
+        return 'unknown'
+
+
 def crop_text_line(pixels, polygon):
     import cv2
     import numpy as np
