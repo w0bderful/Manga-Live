@@ -13,8 +13,6 @@ __pycache__/
 /hotkeys.json
 /api-keys.json.tmp
 /hotkeys.json.tmp
-/overlay-settings.json
-/overlay-settings.json.tmp
 /logs/
 
 /tests/

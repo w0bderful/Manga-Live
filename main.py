@@ -6,6 +6,7 @@ os.environ.setdefault('HF_HOME', str(ROOT / '.models' / 'huggingface'))
 
 import asyncio
 from collections import OrderedDict
+from dataclasses import replace
 from concurrent.futures import Future
 import ctypes
 from ctypes import wintypes
@@ -19,20 +20,20 @@ import time
 import unicodedata
 
 from PIL import Image
-from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap, QIcon, QAction, QActionGroup
+from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, QTimer, QObject, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QRegion, QImage, QBitmap, QIcon, QAction, QActionGroup, QTextLayout, QTextOption, QTextCharFormat
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                             QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout,
-                            QMenuBar, QDialog, QScrollArea, QGridLayout, QSpinBox, QMessageBox)
+                            QMenuBar, QDialog, QScrollArea, QGridLayout, QMessageBox, QFontComboBox, QSpinBox)
 from core import changed, relocate, merge_row, scroll_offset, move_rows
 from translation import (create_translation_client, TRANSLATION_MODES, validate_openai_settings,
                          list_openai_models, get_deepl_usage)
-from ocr_backends import OcrBackend, MODES, validate_device
+from ocr_backends import OcrBackend, MODES, MODE_DESCRIPTIONS, validate_device
 from api_settings import (load_api_key, save_api_keys, load_openai_settings, OPENAI_DEFAULTS,
                           load_translation_provider)
 from window_capture import CaptureWithoutApp, CaptureProtectionError
 from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
-from overlay_settings import DEFAULT_OPACITY, load_opacity, save_opacity
+from overlay_settings import DEFAULT_TEXT_STYLE, load_text_style, save_text_style
 from translation_logs import TranslationLogs, DailyRuntimeLogHandler
 from app_settings import (SOURCE_LANGUAGES, DEFAULT_SOURCE_LANGUAGE, load_source_language,
                           save_source_language, validate_source_language)
@@ -145,6 +146,10 @@ class Engine(threading.Thread):
             pattern = r'[\u3040-\u30ff\u3400-\u9fff]' if self.source_language == 'ja' else r'[A-Za-z\u3040-\u30ff\u3400-\u9fff]'
             if not re.search(pattern, source):
                 continue
+            if self.source_language == 'en' or (self.source_language == 'auto'
+                    and re.search(r'[A-Za-z]', source)
+                    and not re.search(r'[\u3040-\u30ff\u3400-\u9fff]', source)):
+                active_box = replace(active_box, vertical=False)
             self.signals.status.emit(f'{TRANSLATION_MODES[self.provider]} 응답 대기 중… {i+1}/{len(boxes)}')
             translated = await self.translate(client, source)
             if self.stop_event.is_set() or generation < self.cancel_before:
@@ -212,6 +217,7 @@ class Engine(threading.Thread):
                                     validate_device(self.device)
                                     self.signals.status.emit(f'{MODES[self.ocr_mode]} 첫 로딩 중…')
                                     backend = OcrBackend(self.ocr_mode, self.device, ROOT, self.source_language)
+                                    backend.status = self.signals.status.emit
                                 if not self.valid(generation):
                                     continue
                                 self.signals.status.emit('글자 영역 감지 중…')
@@ -237,12 +243,13 @@ class Engine(threading.Thread):
             self.signals.failed.emit(self, self.generation, f'모델 초기화 실패: {exc}\n의존성과 인터넷 연결을 확인한 뒤 재실행하세요.')
 
 
-def vertical_text_layout(text, rect):
+def vertical_text_layout(text, rect, family='Malgun Gothic', max_size=23, bold=False):
     characters = list(unicodedata.normalize('NFC', ' '.join(text.split())))
-    font = QFont('Malgun Gothic')
+    font = QFont(family)
+    font.setBold(bold)
     if not characters or rect.width() <= 0 or rect.height() <= 0:
         return font, []
-    for size in range(23, 0, -1):
+    for size in range(max_size, 0, -1):
         font.setPixelSize(size)
         metrics = QFontMetricsF(font)
         cell_width = max(metrics.height(), *(max(metrics.horizontalAdvance(char),
@@ -267,6 +274,42 @@ def vertical_text_layout(text, rect):
     return font, cells
 
 
+def horizontal_text_layout(text, rect, family='Malgun Gothic', max_size=23, bold=False, outlined=False):
+    text = unicodedata.normalize('NFC', text).replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\u2028')
+    font = QFont(family)
+    font.setBold(bold)
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    option.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+    for size in range(max_size, 0, -1):
+        font.setPixelSize(size)
+        layout = QTextLayout(text, font)
+        layout.setTextOption(option)
+        if outlined:
+            char_format = QTextCharFormat()
+            char_format.setForeground(QColor('white'))
+            char_format.setTextOutline(QPen(QColor('#151515'), min(2.5, size*.12),
+                                           Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            span = QTextLayout.FormatRange()
+            span.start, span.length, span.format = 0, len(text.encode('utf-16-le'))//2, char_format
+            layout.setFormats([span])
+        layout.beginLayout()
+        height = 0.0
+        fits = True
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(max(0.0, rect.width()))
+            line.setPosition(QPointF(0, height))
+            height += line.height()
+            fits = fits and line.naturalTextWidth() <= rect.width() + 1e-6
+        layout.endLayout()
+        if fits and height <= rect.height():
+            return layout, QPointF(rect.x(), rect.y() + (rect.height()-height)/2)
+    return layout, QPointF(rect.x(), rect.y())
+
+
 class Overlay(QWidget):
     def __init__(self):
         super().__init__()
@@ -277,7 +320,7 @@ class Overlay(QWidget):
 
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.background_opacity = DEFAULT_OPACITY
+        self.text_style = dict(DEFAULT_TEXT_STYLE)
         self.rows = []
         self.source_size = (1, 1)
         self.rendered = QImage()
@@ -295,23 +338,23 @@ class Overlay(QWidget):
         layer = QImage(self.size(), QImage.Format.Format_RGBA8888)
         layer.fill(0)
         painter = QPainter(layer)
-        sx, sy = self.width() / source_size[0], self.height() / source_size[1]
-        background = QColor(255, 255, 255, round(255 * self.background_opacity / 100))
         background_region = QRegion()
+        sx, sy = self.width()/source_size[0], self.height()/source_size[1]
         for box, text in rows:
             if text.strip():
                 background_region |= QRegion(QRectF(box.x*sx, box.y*sy, box.w*sx, box.h*sy).toAlignedRect())
-        painter.save()
-        painter.setClipRegion(background_region)
-        painter.fillRect(layer.rect(), background)
-        painter.restore()
+        opacity = self.text_style['background_opacity']
+        if opacity:
+            painter.save()
+            painter.setClipRegion(background_region)
+            painter.fillRect(layer.rect(), QColor(255,255,255,round(255*opacity/100)))
+            painter.restore()
         self.paint_text(painter)
         painter.end()
 
 
         self.rendered = layer
-        mask = (background_region if self.background_opacity else
-                QRegion(QBitmap.fromImage(self.rendered.createAlphaMask())))
+        mask = background_region if opacity else QRegion(QBitmap.fromImage(self.rendered.createAlphaMask()))
         self.setMask(mask if not mask.isEmpty() else QRegion(-2, -2, 1, 1))
         self.show()
         self.update()
@@ -323,7 +366,6 @@ class Overlay(QWidget):
     def paint_text(self, painter):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         sx, sy = self.width()/self.source_size[0], self.height()/self.source_size[1]
-        flags = Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere
         for box, text in self.rows:
             rect = QRectF(box.x*sx, box.y*sy, box.w*sx, box.h*sy)
             padding = min(4, rect.width() / 4, rect.height() / 4)
@@ -331,28 +373,39 @@ class Overlay(QWidget):
             if inner.width() <= 0 or inner.height() <= 0:
                 continue
 
-            if box.h > box.w * 1.25:
-                font, cells = vertical_text_layout(text, inner)
+            vertical = box.vertical if box.vertical is not None else box.h > box.w * 1.25
+            family, max_size = self.text_style['font_family'], self.text_style['font_size']
+            if vertical:
+                font, cells = vertical_text_layout(text, inner, family, max_size, True)
                 painter.save()
-                painter.setClipRect(inner)
+                painter.setClipRect(rect)
                 painter.setFont(font)
-                painter.setPen(QColor('#151515'))
+                painter.setPen(QPen(QColor('#151515'), min(2.5, font.pixelSize()*.12),
+                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                painter.setBrush(QColor('white'))
                 for char, cell in cells:
-                    painter.drawText(cell, int(Qt.AlignmentFlag.AlignCenter), char)
+                    path = QPainterPath()
+                    path.addText(QPointF(0,0), font, char)
+                    bounds = path.boundingRect()
+                    path.translate(cell.center().x()-bounds.center().x(), cell.center().y()-bounds.center().y())
+                    painter.drawPath(path)
+                    painter.save()
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawPath(path)
+                    painter.restore()
                 painter.restore()
                 continue
 
-            font = QFont('Malgun Gothic')
-            for size in range(23, 0, -1):
-                font.setPixelSize(size)
-                bounds = QFontMetricsF(font).boundingRect(inner, int(flags), text)
-                if bounds.height() <= inner.height() and bounds.width() <= inner.width():
-                    break
-            painter.setFont(font)
-            painter.setPen(QColor('#151515'))
+            layout, position = horizontal_text_layout(text, inner, family, max_size, True, outlined=True)
             painter.save()
-            painter.setClipRect(inner)
-            painter.drawText(inner, int(flags), text)
+            painter.setClipRect(rect)
+            layout.draw(painter, position)
+            fill = QTextCharFormat()
+            fill.setForeground(QColor('white'))
+            fill.setTextOutline(QPen(Qt.PenStyle.NoPen))
+            span = QTextLayout.FormatRange()
+            span.start, span.length, span.format = 0, len(layout.text().encode('utf-16-le'))//2, fill
+            layout.draw(painter, position, [span])
             painter.restore()
 
 
@@ -363,12 +416,23 @@ class RegionIndicator(QWidget):
                             Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput |
                             Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.hide_timer.timeout.connect(self.hide)
 
-    def show_region(self, area):
+    def show_region(self, area, duration_ms=0):
+        self.hide_timer.stop()
         self.setGeometry(area.adjusted(-3, -3, 3, 3))
         self.setMask(QRegion(self.rect()) - QRegion(self.rect().adjusted(3, 3, -3, -3)))
         self.show()
         self.raise_()
+        if duration_ms:
+            self.hide_timer.start(duration_ms)
+
+    def hideEvent(self, event):
+        self.hide_timer.stop()
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -490,13 +554,12 @@ class Controller(QWidget):
         self.setAutoFillBackground(True)
         self.resize(510, 230)
         self.overlay = Overlay()
-        self.region_indicator = RegionIndicator()
-        opacity_error = ''
+        style_error = ''
         try:
-            self.overlay.background_opacity = load_opacity()
+            self.overlay.text_style = load_text_style()
         except (OSError, ValueError):
-            opacity_error = '배경 설정을 읽지 못해 기본값을 사용합니다. 값을 변경하면 다시 저장합니다.'
-            log.warning('Overlay settings could not be loaded', exc_info=True)
+            style_error = '글자 표시 설정을 읽지 못해 기본값을 사용합니다. settings.json을 확인하세요.'
+        self.region_indicator = RegionIndicator()
         self.capture = CaptureWithoutApp()
         self.region = None
         self.reference = None
@@ -578,6 +641,7 @@ class Controller(QWidget):
         self.ocr_mode = QComboBox()
         for key, label in MODES.items():
             self.ocr_mode.addItem(label, key)
+            self.ocr_mode.setItemData(self.ocr_mode.count()-1, MODE_DESCRIPTIONS[key], Qt.ItemDataRole.ToolTipRole)
         layout.addWidget(self.ocr_mode)
         ocr_note = QLabel('OCR 선택은 자동으로 적용됩니다. OpenCV 감지는 CPU에서 실행됩니다.')
         ocr_note.setWordWrap(True)
@@ -596,7 +660,7 @@ class Controller(QWidget):
         self.api_key_save_timer.timeout.connect(self.change_device)
         layout.addWidget(QLabel('원문 언어'))
         self.source_language = QComboBox()
-        self.source_language.setToolTip('자동 감지는 일본어·영어 원문을 인식합니다. 자동 감지·영어는 EasyOCR로 글자를 읽습니다.')
+        self.source_language.setToolTip('자동 감지는 일본어·영어 원문을 인식합니다. 자동 감지·영어는 EasyOCR로 읽고 불확실한 영어는 TrOCR로 보완합니다.')
         for code, label in SOURCE_LANGUAGES.items():
             self.source_language.addItem(label, code)
         self.source_language.setCurrentIndex(self.source_language.findData(initial_language))
@@ -715,21 +779,32 @@ class Controller(QWidget):
         self.detection_mode.addItem('정밀 감지 (작은 글씨 · 느림)', 1920)
         self.detection_mode.currentIndexChanged.connect(self.change_detection_mode)
         layout.addWidget(self.detection_mode)
-        self.background_settings_panel = QWidget()
-        background_form = QFormLayout(self.background_settings_panel)
-        background_form.setContentsMargins(0, 0, 0, 0)
-        self.background_opacity = QSpinBox()
-        self.background_opacity.setRange(0, 100)
-        self.background_opacity.setSuffix(' %')
-        self.background_opacity.setValue(self.overlay.background_opacity)
-        self.background_opacity.setToolTip('0%: 배경 없음 · 100%: 완전히 불투명한 흰색 배경')
-        background_form.addRow('텍스트 배경 불투명도', self.background_opacity)
-        self.background_settings_note = QLabel(opacity_error)
-        self.background_settings_note.setWordWrap(True)
-        self.background_settings_note.setVisible(bool(opacity_error))
-        background_form.addRow(self.background_settings_note)
-        self.background_opacity.valueChanged.connect(self.change_background_opacity)
-        layout.addWidget(self.background_settings_panel)
+        self.text_style_panel = QWidget()
+        style_form = QFormLayout(self.text_style_panel)
+        style_form.setContentsMargins(0,0,0,0)
+        self.translation_font = QFontComboBox()
+        self.translation_font.setCurrentFont(QFont(self.overlay.text_style['font_family']))
+        style_form.addRow('번역 글꼴', self.translation_font)
+        self.translation_font_size = QSpinBox()
+        self.translation_font_size.setRange(8,72)
+        self.translation_font_size.setSuffix(' px')
+        self.translation_font_size.setValue(self.overlay.text_style['font_size'])
+        self.translation_font_size.setToolTip('설정한 크기를 기준으로 표시하며, 영역에 들어가지 않으면 자동으로 줄입니다.')
+        style_form.addRow('글자 크기', self.translation_font_size)
+        self.text_background_opacity = QSpinBox()
+        self.text_background_opacity.setRange(0,100)
+        self.text_background_opacity.setSuffix(' %')
+        self.text_background_opacity.setValue(self.overlay.text_style['background_opacity'])
+        self.text_background_opacity.setToolTip('흰색 배경: 0%는 없음, 100%는 완전 불투명. 글자는 항상 선명하게 표시합니다.')
+        style_form.addRow('배경 불투명도', self.text_background_opacity)
+        self.text_style_note = QLabel(style_error)
+        self.text_style_note.setWordWrap(True)
+        self.text_style_note.setVisible(bool(style_error))
+        style_form.addRow(self.text_style_note)
+        self.translation_font.currentFontChanged.connect(self.change_text_style)
+        self.translation_font_size.valueChanged.connect(self.change_text_style)
+        self.text_background_opacity.valueChanged.connect(self.change_text_style)
+        layout.addWidget(self.text_style_panel)
         self.status = QLabel('준비 중…')
         self.status.setWordWrap(True)
         self.main_layout.addWidget(self.status)
@@ -800,7 +875,7 @@ class Controller(QWidget):
         self.settings_panel.show()
         self.inline_settings.setVisible(advanced)
         self.capture_note.setVisible(advanced)
-        self.background_settings_panel.setVisible(advanced)
+        self.text_style_panel.setVisible(advanced)
         self.interface_mode = mode
         self.basic_mode_action.setChecked(not advanced)
         self.advanced_mode_action.setChecked(advanced)
@@ -808,19 +883,21 @@ class Controller(QWidget):
         available = self.screen().availableGeometry()
         self.resize(560 if advanced else 510, min(850, available.height() - 80) if advanced else self.minimumSizeHint().height())
 
-    def change_background_opacity(self, value):
-        self.overlay.background_opacity = value
-        try:
-            save_opacity(value)
-        except (OSError, ValueError):
-            self.background_settings_note.setText('배경 설정을 저장하지 못했습니다. 파일 쓰기 권한을 확인하세요.')
-            self.background_settings_note.show()
-            log.warning('Overlay settings could not be saved', exc_info=True)
-        else:
-            self.background_settings_note.clear()
-            self.background_settings_note.hide()
+    def change_text_style(self, *_):
+        style = {'font_family': self.translation_font.currentFont().family(),
+                 'font_size': self.translation_font_size.value(),
+                 'background_opacity': self.text_background_opacity.value()}
+        self.overlay.text_style = style
         if self.overlay.rows:
             self.overlay.display(self.overlay.rows, self.overlay.source_size)
+        try:
+            save_text_style(style)
+        except (OSError, ValueError):
+            self.text_style_note.setText('글자 표시 설정을 저장하지 못했습니다. settings.json의 상태와 권한을 확인하세요.')
+            self.text_style_note.show()
+        else:
+            self.text_style_note.clear()
+            self.text_style_note.hide()
 
     def open_settings(self):
         if self.inline_settings.widget() is self.settings_panel:
@@ -973,6 +1050,8 @@ class Controller(QWidget):
 
     def translation_is_current(self):
         return (self.worker_ready and not self.engine.stop_event.is_set()
+                and self.engine.device == self.device_mode.currentData()
+                and self.engine.ocr_mode == self.ocr_mode.currentData()
                 and self.engine.source_language == self.source_language.currentData()
                 and self.engine.provider == self.translation_mode.currentData()
                 and self.engine.api_key == self.selected_api_key()
@@ -1217,8 +1296,7 @@ class Controller(QWidget):
             self.status.setText(f'영역 좌표 조회 실패: {exc} — 영역을 다시 선택하세요.')
             return
         log.info('Selected region=%s', self.region)
-        if not self.single_shot:
-            self.region_indicator.show_region(area)
+        self.region_indicator.show_region(area, duration_ms=3000 if self.single_shot else 0)
         self.update_capture_mode()
         if self.single_shot:
             self.capture_snapshot()

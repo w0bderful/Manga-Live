@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 import cv2
 
@@ -9,6 +9,7 @@ class Box:
     y: int
     w: int
     h: int
+    vertical: bool | None = None
 
     def crop(self):
         return self.x, self.y, self.x + self.w, self.y + self.h
@@ -39,7 +40,7 @@ def relocate(box, before, after):
            max(0, nx-box.w//2):nx+box.w//2+1] = -1
     if float(scores.max()) > score-0.04:
         return None
-    return Box(left+nx, ny, box.w, box.h)
+    return replace(box, x=left+nx, y=ny)
 
 
 def merge_row(rows, incoming):
@@ -106,7 +107,7 @@ def scroll_offset(before, after):
 def move_rows(rows, offset, shape):
     height, width = shape[:2]
     dx, dy = offset
-    moved = [(Box(b.x+dx, b.y+dy, b.w, b.h), text) for b, text in rows]
+    moved = [(replace(b, x=b.x+dx, y=b.y+dy), text) for b, text in rows]
     return [(b, text) for b, text in moved
             if b.x < width and b.y < height and b.x+b.w > 0 and b.y+b.h > 0]
 
@@ -126,10 +127,12 @@ def text_boxes(horizontal, free, width, height):
         raw.append((*points.min(axis=0), *points.max(axis=0)))
     boxes = []
     for x1, y1, x2, y2 in raw:
+        w, h = x2-x1, y2-y1
+        vertical = True if h > w*1.25 else False if w > h*1.25 else None
         x1, y1 = max(0, int(x1)-3), max(0, int(y1)-3)
         x2, y2 = min(width, int(x2)+4), min(height, int(y2)+4)
         if x2-x1 >= 8 and y2-y1 >= 8:
-            boxes.append(Box(x1, y1, x2-x1, y2-y1))
+            boxes.append(Box(x1, y1, x2-x1, y2-y1, vertical))
     while True:
         merged = False
         for i, a in enumerate(boxes):
@@ -144,8 +147,11 @@ def text_boxes(horizontal, free, width, height):
                 overlap = xo > 0 and yo > 0
                 if row or col or overlap:
                     x, y = min(a.x, b.x), min(a.y, b.y)
+                    direction = a.vertical if a.vertical is not None else b.vertical
+                    if a.vertical is not None and b.vertical is not None and a.vertical != b.vertical:
+                        direction = a.vertical if a.w*a.h >= b.w*b.h else b.vertical
                     boxes[i] = Box(x, y, max(a.x+a.w, b.x+b.w)-x,
-                                   max(a.y+a.h, b.y+b.h)-y)
+                                   max(a.y+a.h, b.y+b.h)-y, direction)
                     boxes.pop(j)
                     merged = True
                     break

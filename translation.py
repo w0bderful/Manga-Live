@@ -339,6 +339,7 @@ def read_stream(response):
 class LunaTranslationClient:
     def __init__(self, api_key):
         self.api_key = api_key.strip()
+        validate_api_key(self.api_key)
         self.connection = None
 
     async def __aenter__(self):
@@ -405,8 +406,14 @@ class LunaTranslationClient:
             raise RuntimeError('Kie API 번역이 완료되지 않았습니다. 다시 번역을 눌러주세요.')
         result = data.get('output_text')
         if not isinstance(result, str) or not result.strip():
+            output = data.get('output') or []
+            if not isinstance(output, list) or any(
+                    isinstance(item, dict) and item.get('type') == 'message'
+                    and item.get('content') is not None and not isinstance(item['content'], list)
+                    for item in output):
+                raise RuntimeError('Kie API 번역 결과 형식이 올바르지 않습니다.')
             result = ''.join(
-                part['text'] for item in (data.get('output') or [])
+                part['text'] for item in output
                 if isinstance(item, dict) and item.get('type') == 'message'
                 for part in (item.get('content') or [])
                 if isinstance(part, dict) and part.get('type') == 'output_text'

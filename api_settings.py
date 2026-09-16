@@ -44,7 +44,8 @@ def read_key_file(path, fields, recover=False, required=False):
         backup_dir = path.parent / 'api-key-backups'
         backup_dir.mkdir(exist_ok=True)
         backup = backup_dir / f'{path.stem}-{uuid4().hex}{path.suffix}'
-        path.replace(backup)
+        # Keep the original in place until the replacement has been written successfully.
+        backup.write_bytes(path.read_bytes())
         return {key: value for key, value in data.items()
                 if key not in fields or isinstance(value, str)}
 
@@ -61,6 +62,8 @@ def migrate_keys(recover=False, provider=None):
             continue
         old_value = read_key_file(legacy, [env_name], recover, required=True).get(env_name)
         if old_value is None:
+            if recover:
+                migrated.append(legacy)
             continue
         if field not in data:
             data[field] = old_value.strip()
