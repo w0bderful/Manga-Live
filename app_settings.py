@@ -2,7 +2,8 @@ import json
 from pathlib import Path
 import threading
 
-SETTINGS_FILE = Path(__file__).resolve().parent / 'settings.json'
+from runtime_paths import APP_DIR
+SETTINGS_FILE = APP_DIR / 'settings.json'
 SOURCE_LANGUAGES = {'auto': '자동 언어 감지', 'ja': '일본어', 'en': '영어'}
 DEFAULT_SOURCE_LANGUAGE = 'ja'
 DETECTION_METHODS = {'comic': 'Comic Text Detector', 'opencv': 'OpenCV (기존 방식)'}

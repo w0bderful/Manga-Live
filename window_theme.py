@@ -2,7 +2,7 @@
 import math
 import random
 import time
-from pathlib import Path
+from runtime_paths import RESOURCE_DIR
 
 from PyQt6.QtCore import QEvent, Qt, QTimer
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPalette
@@ -70,7 +70,7 @@ QCheckBox::indicator:checked {
     image: url("CHECKMARK_ASSET");
 }
 '''
-STYLE = STYLE.replace('CHECKMARK_ASSET',(Path(__file__).resolve().parent/'assets/checkmark.svg').as_posix())
+STYLE = STYLE.replace('CHECKMARK_ASSET',(RESOURCE_DIR/'assets/checkmark.svg').as_posix())
 
 
 class SakuraBackdrop(QWidget):

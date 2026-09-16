@@ -21,3 +21,7 @@ __pycache__/
 
 /settings.json
 /settings.json.tmp
+/build/
+/output/
+/.manga-live-runtime/
+/.manga-live-launcher-*.tmp

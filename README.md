@@ -51,6 +51,44 @@ python -m venv .venv
 
 다음 실행부터는 마지막 명령만 사용하면 됩니다.
 
+### EXE 만들기 (auto-py-to-exe)
+
+의존성을 설치한 가상환경에서 다음 명령을 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\.venv\Scripts\python.exe build_exe.py
+```
+
+`auto-py-to-exe.json` 설정을 읽어 auto-py-to-exe의 빌드 기능으로 **`output/Manga Live/Manga Live.exe`**를 만듭니다. GPU 라이브러리가 크므로 폴더형으로 생성합니다. 실행할 PC에는 Python을 따로 설치할 필요가 없지만, GPU 사용에는 호환 NVIDIA 드라이버가 필요합니다.
+
+- 배포·이동할 때는 `_internal`을 포함한 **`Manga Live` 폴더 전체**를 함께 옮기세요.
+- 설정·API 키·로그·모델은 EXE와 같은 폴더 아래에 저장합니다. 쓰기 가능한 폴더에서 실행하세요.
+- 개인 API 키와 설정은 빌드에 포함하지 않습니다. EXE에서 다시 설정하거나 본인 PC에서 필요한 설정 파일을 직접 복사하세요.
+- 모델은 최초 실행 시 다운로드합니다. 이미 다운로드한 프로젝트의 `.models` 폴더를 EXE 옆에 복사하면 재사용할 수 있습니다.
+- 재빌드할 출력 폴더에 설정·로그·모델이 있으면 사용자 데이터 보호를 위해 중단합니다. 해당 폴더를 별도로 보관한 뒤 다시 빌드하세요.
+
+### 통합 EXE 만들기
+
+배포용 **Manga Live.exe 하나**가 필요한 라이브러리를 설치하고 같은 프로세스에서 프로그램을 실행합니다. 별도의 설치기나 `Manga Live App.exe`를 실행하지 않습니다.
+
+```powershell
+.\.venv\Scripts\python.exe build_exe.py --runtime --output output/integrated-runtime
+.\.venv\Scripts\python.exe build_downloader.py --source "output/integrated-runtime/Manga Live" --asset-base-url https://github.com/w0bderful/Manga-Live/releases/download/런타임태그
+```
+
+`output/downloader/Manga Live.exe`와 `Manga-Live-runtime-*.zip`이 생성됩니다. ZIP 파일을 별도 런타임 릴리스에 먼저 게시하고, 사용자용 릴리스에는 EXE 하나만 올립니다. 사용자는 EXE 하나를 받고 실행하면 됩니다.
+
+- 첫 실행 때 진행률을 표시하며 필요한 파일을 다운로드·검증·압축 해제합니다. Python 설치는 필요하지 않습니다.
+- 취소하거나 연결이 끊기면 다음 실행에서 다운로드를 재개합니다. 서버가 재개를 지원하지 않으면 해당 파일을 처음부터 다시 받습니다.
+- SHA-256과 파일 구성을 검사한 뒤 설치를 완료합니다. 이후에는 로컬 파일을 검사하고 재사용합니다. 설치된 파일이 없어지거나 손상되면 다시 받습니다.
+- 설치 완료 후 다운로드한 ZIP과 임시 압축 해제 폴더를 자동 삭제합니다. 완료되지 않은 다운로드는 이어받기를 위해 유지하며, 설치 완료 시 정리합니다.
+- 의존성은 실행기 옆의 `.manga-live-runtime/`에, 사용자 설정·키·모델·로그는 실행기 옆에 저장합니다. 쓰기 권한과 수 GB의 여유 공간이 필요합니다.
+- OCR 모델은 앱의 첫 실행 때 별도로 다운로드합니다. GPU 실행에는 호환 NVIDIA GPU와 드라이버가 필요합니다.
+- **7일마다** 새 정식 릴리스를 확인하며, 창 아래의 **버전 확인** 버튼으로 언제든 확인할 수 있습니다. 마지막 확인 시각은 `settings.json`에 저장합니다. 확인은 프로그램 실행 중에 이루어집니다.
+- 새 버전이 있으면 다운로드 여부를 묻습니다. 동의하면 EXE를 받아 SHA-256을 검증하고, 다음 실행 때 기존 프로그램이 종료된 뒤 교체합니다. 설정·키·모델은 유지합니다. 교체가 끝난 업데이트 다운로드 파일도 자동 삭제합니다.
+- 업데이트 파일 다운로드나 검증이 실패하면 기존 EXE를 유지합니다. 소스 실행에서는 새 버전의 릴리스 페이지를 열 수 있습니다.
+
 ## 화면과 초기 설정
 
 모니터, 기본·고급 모드, OCR 처리 장치, 감지 해상도, 말풍선 하나 모드, 최상단 고정은 마지막 선택을 저장하고 재실행 시 복원합니다. 저장값이 없으면 **기본 모드**, **GPU**, **원본 감지 해상도**, **말풍선 하나 모드 꺼짐**, **최상단 고정 켜짐**으로 시작합니다. 번역 서비스는 마지막 선택을 복원하고, 저장된 선택이 없으면 Luna를 사용합니다.

@@ -1,7 +1,6 @@
 import os
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+from runtime_paths import APP_DIR as ROOT, RESOURCE_DIR
 os.environ.setdefault('HF_HOME', str(ROOT / '.models' / 'huggingface'))
 
 import asyncio
@@ -38,6 +37,7 @@ from window_theme import (SakuraBackdrop, apply_window_theme, WINDOW_THEMES, DEF
                           load_window_theme, save_window_theme)
 from translation_logs import TranslationLogs, DailyRuntimeLogHandler
 from resource_usage import ResourceMonitor
+from update_ui import VersionUpdater
 from app_settings import (SOURCE_LANGUAGES, DEFAULT_SOURCE_LANGUAGE, load_source_language,
                           save_source_language, validate_source_language,
                           UI_DEFAULTS, load_ui_settings, save_ui_settings,
@@ -997,6 +997,8 @@ class Controller(QWidget):
         self.resource_note.setWordWrap(True)
         self.resource_note.setToolTip('현재 프로그램의 사용량입니다. CPU는 전체 논리 코어 기준, GPU는 가장 바쁜 엔진 기준, VRAM은 전용 GPU 메모리입니다. 조회 불가는 드라이버가 정보를 제공하지 않는 경우입니다.')
         self.main_layout.addWidget(self.resource_note)
+        self.version_updates = VersionUpdater(self, ROOT)
+        self.main_layout.addWidget(self.version_updates.panel)
         self.resource_monitor = ResourceMonitor()
         self.resource_monitor.start()
         layout.addStretch()
@@ -1021,6 +1023,8 @@ class Controller(QWidget):
         for control in (self.manual, self.always_on_top):
             control.toggled.connect(self.save_current_ui_settings)
         self.engine.start()
+
+        self.version_updates.start()
 
     def save_current_ui_settings(self, *_):
         if self.restoring_settings:
@@ -1707,6 +1711,7 @@ class Controller(QWidget):
                 self.status.setText(f'{len(self.overlay.rows)}개 영역 표시 · 화면 변화 대기 중')
 
     def closeEvent(self, event):
+        self.version_updates.close()
         self.resource_monitor.close()
         self.save_current_ui_settings()
         self.settings_dialog.close()
@@ -1763,7 +1768,7 @@ def main():
     except OSError:
         log.warning('Windows app identity could not be set', exc_info=True)
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(str(ROOT / 'assets' / 'manga-live.ico')))
+    app.setWindowIcon(QIcon(str(RESOURCE_DIR / 'assets' / 'manga-live.ico')))
     app.setQuitOnLastWindowClosed(False)
     window = Controller(io_logger=io_logger)
     if logging_warning:
@@ -1775,4 +1780,6 @@ def main():
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main())

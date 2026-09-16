@@ -1,0 +1,18 @@
+{
+  "version": "auto-py-to-exe-configuration_v1",
+  "pyinstallerOptions": [
+    {"optionDest": "filenames", "value": "main.py"},
+    {"optionDest": "onefile", "value": false},
+    {"optionDest": "console", "value": false},
+    {"optionDest": "name", "value": "Manga Live"},
+    {"optionDest": "icon_file", "value": "assets/manga-live.ico"},
+    {"optionDest": "noconfirm", "value": true},
+    {"optionDest": "noupx", "value": true},
+    {"optionDest": "clean", "value": true}
+  ],
+  "nonPyinstallerOptions": {
+    "increaseRecursionLimit": true,
+    "outputDirectory": "output",
+    "manualArguments": "--add-data assets:assets --add-data licenses:licenses --add-data THIRD_PARTY_NOTICES.md:. --add-binary .venv/Lib/site-packages/torchvision/*.pyd:torchvision --add-binary .venv/Lib/site-packages/torchvision/*.dll:torchvision --collect-all transformers --collect-all manga_ocr --collect-all unidic_lite --collect-all fugashi --collect-all wordfreq --collect-all onnxruntime --hidden-import mss.windows --hidden-import sentencepiece --hidden-import torchvision"
+  }
+}

@@ -1,10 +1,9 @@
 import json
 import os
-from pathlib import Path
 from uuid import uuid4
 from app_settings import read_settings, update_settings
 
-ROOT = Path(__file__).resolve().parent
+from runtime_paths import APP_DIR as ROOT
 API_KEYS_FILE = ROOT / 'api-keys.json'
 FIELDS = {'luna': ('kie_api_key', 'KIE_API_KEY'), 'deepl': ('deepl_api_key', 'DEEPL_API_KEY'),
           'openai': ('openai_api_key', 'OPENAI_API_KEY')}
