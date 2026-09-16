@@ -5,10 +5,12 @@ import threading
 SETTINGS_FILE = Path(__file__).resolve().parent / 'settings.json'
 SOURCE_LANGUAGES = {'auto': '자동 언어 감지', 'ja': '일본어', 'en': '영어'}
 DEFAULT_SOURCE_LANGUAGE = 'ja'
+DETECTION_METHODS = {'comic': 'Comic Text Detector', 'opencv': 'OpenCV (기존 방식)'}
+DEFAULT_DETECTION_METHOD = 'comic'
 UI_DEFAULTS = {
     'monitor': '', 'interface_mode': 'basic', 'always_on_top': True,
     'device': 'cuda', 'detection_size': None,
-    'single_balloon': False,
+    'single_balloon': False, 'detection_method': DEFAULT_DETECTION_METHOD,
 }
 _lock = threading.RLock()
 
@@ -55,7 +57,8 @@ def validate_ui_settings(value):
     if not isinstance(value, dict):
         raise ValueError('화면 설정은 JSON 객체여야 합니다.')
     result = {**UI_DEFAULTS, **value}
-    choices = {'interface_mode': ('basic', 'advanced'), 'device': ('cpu', 'cuda')}
+    choices = {'interface_mode': ('basic', 'advanced'), 'device': ('cpu', 'cuda'),
+               'detection_method': tuple(DETECTION_METHODS)}
     for key, options in choices.items():
         if not isinstance(result[key], str) or result[key] not in options:
             raise ValueError(f'잘못된 화면 설정: {key}')

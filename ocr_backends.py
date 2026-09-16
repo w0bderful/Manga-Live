@@ -7,7 +7,7 @@ import logging
 import cv2
 import numpy as np
 from core import Box, text_boxes
-from app_settings import validate_source_language
+from app_settings import validate_source_language, DETECTION_METHODS
 
 log = logging.getLogger(__name__)
 
@@ -306,9 +306,11 @@ class OcrModels:
         self.mocr = None
         self.handwriting = None
         self.handwriting_failed = False
+        self.comic_detector = None
 
-    def preload(self, status, stopped, progress=lambda *args: None):
-        progress(0, 4, 'OCR 로딩')
+    def preload(self, status, stopped, progress=lambda *args: None, detection_method='opencv'):
+        total = 5 if detection_method == 'comic' else 4
+        progress(0, total, 'OCR 로딩')
         validate_device(self.device)
         for step, (language, languages) in enumerate([('ja', ['ja', 'en']), ('en', ['en'])], 1):
             if stopped():
@@ -319,7 +321,7 @@ class OcrModels:
                 self.readers[language] = easyocr.Reader(languages, gpu=self.device == 'cuda',
                     model_storage_directory=str(self.root/'.models'/'easyocr'),
                     user_network_directory=str(self.root/'.models'/'easyocr'/'user'))
-            progress(step, 4, 'OCR 로딩')
+            progress(step, total, 'OCR 로딩')
         if stopped():
             return False
         if self.mocr is None:
@@ -329,7 +331,7 @@ class OcrModels:
             model.model.to(self.device)
             model.model.eval()
             self.mocr = model
-        progress(3, 4, 'OCR 로딩')
+        progress(3, total, 'OCR 로딩')
         if stopped():
             return False
         if self.handwriting is None:
@@ -341,12 +343,31 @@ class OcrModels:
             except Exception as exc:
                 self.handwriting_failed = True
                 log.warning('Handwriting preload failed (%s)', type(exc).__name__)
-        progress(4, 4, 'OCR 로딩 완료' if not self.handwriting_failed else 'OCR 준비 · 영어는 EasyOCR 사용')
+        progress(4, total, 'OCR 로딩')
+        if detection_method == 'comic' and self.comic_detector is None:
+            if stopped():
+                return False
+            try:
+                from comic_detector import ComicTextDetector
+                self.comic_detector = ComicTextDetector(self.root, status, stopped, device=self.device)
+            except Exception as exc:
+                if stopped():
+                    return False
+                raise RuntimeError('Comic Text Detector 준비에 실패했습니다. setup.bat·인터넷 연결·모델 저장 권한을 '
+                                   '확인하세요. GPU 오류라면 CPU 모드를 선택하거나 영역 감지를 '
+                                   'OpenCV (기존 방식)로 변경하세요.') from exc
+        progress(total, total, 'OCR 로딩 완료' if not self.handwriting_failed else 'OCR 준비 · 영어는 EasyOCR 사용')
         return not stopped()
 
 
 class OcrBackend:
-    def __init__(self, device, root, source_language='ja', models=None):
+    def __init__(self, device, root, source_language='ja', models=None,
+                 detection_method='opencv', stopped=lambda: False):
+        if detection_method not in DETECTION_METHODS:
+            raise ValueError('지원하지 않는 영역 감지 방식입니다.')
+        self.detection_method = detection_method
+        self.stopped = stopped
+        self.comic_detector = getattr(models, 'comic_detector', None) if models is not None else None
         self.source_language = validate_source_language(source_language)
         self.languages = ['en'] if source_language == 'en' else ['ja', 'en']
         self.reader = None
@@ -390,11 +411,24 @@ class OcrBackend:
             return [Box(0, 0, width, height)]
         if float(cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY).std()) < 2:
             return []
-        candidates = self.detect_opencv(pixels, canvas_size)
-        regions = self.detect_craft(pixels, canvas_size)
-        regions = verified_opencv_boxes(candidates, regions)
-        regions = fit_balloon_regions(pixels, regions)
-        regions = split_panel_regions(pixels, regions)
+        if self.detection_method == 'comic':
+            if self.comic_detector is None:
+                from comic_detector import ComicTextDetector
+                self.comic_detector = ComicTextDetector(self.root, self.status or (lambda _: None),
+                                                        self.stopped, device=self.device)
+            try:
+                regions = self.comic_detector.detect(pixels, canvas_size, self.stopped)
+            except Exception as exc:
+                if self.stopped():
+                    raise
+                raise RuntimeError('Comic Text Detector 감지에 실패했습니다. 다시 번역하거나 CPU 모드 또는 '
+                                   '영역 감지를 OpenCV (기존 방식)로 변경하세요.') from exc
+        else:
+            candidates = self.detect_opencv(pixels, canvas_size)
+            regions = self.detect_craft(pixels, canvas_size)
+            regions = verified_opencv_boxes(candidates, regions)
+            regions = fit_balloon_regions(pixels, regions)
+            regions = split_panel_regions(pixels, regions)
         if self.source_language == 'auto':
             from PIL import Image
             languages = []

@@ -40,7 +40,8 @@ from translation_logs import TranslationLogs, DailyRuntimeLogHandler
 from resource_usage import ResourceMonitor
 from app_settings import (SOURCE_LANGUAGES, DEFAULT_SOURCE_LANGUAGE, load_source_language,
                           save_source_language, validate_source_language,
-                          UI_DEFAULTS, load_ui_settings, save_ui_settings)
+                          UI_DEFAULTS, load_ui_settings, save_ui_settings,
+                          DETECTION_METHODS, DEFAULT_DETECTION_METHOD)
 
 log = logging.getLogger(__name__)
 TRANSLATION_RETRIES = 5
@@ -104,10 +105,14 @@ class Signals(QObject):
 class Engine(threading.Thread):
 
     def __init__(self, signals, device='cpu', api_key='', provider='luna',
-                 base_url='', model='', io_logger=None, source_language='ja', ocr_models=None):
+                 base_url='', model='', io_logger=None, source_language='ja', ocr_models=None,
+                 detection_method=DEFAULT_DETECTION_METHOD):
         super().__init__(daemon=True)
         self.signals = signals
         self.device = device
+        if detection_method not in DETECTION_METHODS:
+            raise ValueError('지원하지 않는 영역 감지 방식입니다.')
+        self.detection_method = detection_method
         self.source_language = validate_source_language(source_language)
         self.api_key = api_key
         self.provider = provider
@@ -238,7 +243,8 @@ class Engine(threading.Thread):
     def run(self):
         try:
             if not self.ocr_models.preload(self.signals.status.emit, self.stop_event.is_set,
-                    lambda done, total, label: self.signals.progress.emit(self, -1, done, total, label)):
+                    lambda done, total, label: self.signals.progress.emit(self, -1, done, total, label),
+                    detection_method=self.detection_method):
                 return
             if self.provider != 'openai' and not self.api_key.strip():
                 self.signals.failed.emit(self, self.generation, '선택한 번역 서비스의 API 키를 입력하세요. 입력 후 자동으로 적용됩니다.')
@@ -247,7 +253,8 @@ class Engine(threading.Thread):
                 async def work():
                     import torch
                     backend = OcrBackend(self.device, ROOT, self.source_language,
-                                         models=self.ocr_models)
+                                         models=self.ocr_models, detection_method=self.detection_method,
+                                         stopped=self.stop_event.is_set)
                     backend.status = self.signals.status.emit
                     async with create_translation_client(self.provider, self.api_key,
                                                          base_url=self.base_url, model=self.model) as client:
@@ -359,6 +366,43 @@ def horizontal_text_layout(text, rect, family='Malgun Gothic', max_size=23, bold
     return layout, QPointF(rect.x(), rect.y())
 
 
+def overlay_rectangles(rows, sx=1., sy=1.):
+    """Reserve disjoint display space without changing the OCR source boxes."""
+    rects = [QRectF(box.x*sx, box.y*sy, box.w*sx, box.h*sy)
+             if text.strip() else QRectF() for box, text in rows]
+    # Stable ordering keeps placement independent of translation completion order.
+    order = sorted(range(len(rows)), key=lambda i: (
+        rects[i].y(), rects[i].x(), rects[i].width(), rects[i].height(), rows[i][1]))
+    for position, i in enumerate(order):
+        for j in order[position+1:]:
+            a, b = rects[i], rects[j]
+            if not a.intersects(b):
+                continue
+            options = []
+            for horizontal in (True, False):
+                start = (lambda r: r.left()) if horizontal else (lambda r: r.top())
+                end = (lambda r: r.right()) if horizontal else (lambda r: r.bottom())
+                low, high = sorted((i, j), key=lambda k: start(rects[k])+end(rects[k]))
+                first, second = rects[low], rects[high]
+                # Divide the shared strip; both new rectangles remain inside
+                # their original regions. Shrinking cannot create new overlaps.
+                cut = (max(start(first), start(second))+min(end(first), end(second)))/2
+                gap = min(2., (cut-start(first))/2, (end(second)-cut)/2)
+                first_size = cut-gap/2-start(first)
+                second_size = end(second)-cut-gap/2
+                retained = (first_size/(end(first)-start(first)),
+                            second_size/(end(second)-start(second)))
+                options.append((min(retained), sum(retained), horizontal, low, high, cut, gap))
+            _, _, horizontal, low, high, cut, gap = max(options, key=lambda item: item[:2])
+            if horizontal:
+                rects[low].setRight(cut-gap/2)
+                rects[high].setLeft(cut+gap/2)
+            else:
+                rects[low].setBottom(cut-gap/2)
+                rects[high].setTop(cut+gap/2)
+    return rects
+
+
 class Overlay(QWidget):
     def __init__(self):
         super().__init__()
@@ -389,9 +433,9 @@ class Overlay(QWidget):
         painter = QPainter(layer)
         background_region = QRegion()
         sx, sy = self.width()/source_size[0], self.height()/source_size[1]
-        for box, text in rows:
+        for rect, (_, text) in zip(overlay_rectangles(rows, sx, sy), rows):
             if text.strip():
-                background_region |= QRegion(QRectF(box.x*sx, box.y*sy, box.w*sx, box.h*sy).toAlignedRect())
+                background_region |= QRegion(rect.toAlignedRect())
         opacity = self.text_style['background_opacity']
         if opacity:
             painter.save()
@@ -415,8 +459,7 @@ class Overlay(QWidget):
     def paint_text(self, painter):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         sx, sy = self.width()/self.source_size[0], self.height()/self.source_size[1]
-        for box, text in self.rows:
-            rect = QRectF(box.x*sx, box.y*sy, box.w*sx, box.h*sy)
+        for rect, (box, text) in zip(overlay_rectangles(self.rows, sx, sy), self.rows):
             padding = min(4, rect.width() / 4, rect.height() / 4)
             inner = rect.adjusted(padding, padding, -padding, -padding)
             if inner.width() <= 0 or inner.height() <= 0:
@@ -657,6 +700,7 @@ class Controller(QWidget):
             initial_language = DEFAULT_SOURCE_LANGUAGE
             language_error = '원문 언어 설정을 읽지 못해 일본어를 사용합니다. settings.json을 확인하세요.'
         self.engine = Engine(self.signals, device=initial_ui['device'],
+                             detection_method=initial_ui['detection_method'],
                              api_key=initial_keys[initial_provider],
                              provider=initial_provider, base_url=initial_openai_settings['base_url'],
                              model=initial_openai_settings['model'], io_logger=self.io_logger,
@@ -738,7 +782,7 @@ class Controller(QWidget):
         self.device_mode.addItem('GPU 모드 (NVIDIA CUDA)', 'cuda')
         self.device_mode.setCurrentIndex(self.device_mode.findData(self.engine.device))
         add_setting('OCR 처리 장치',self.device_mode,0,1)
-        ocr_note = QLabel('OpenCV 영역 감지·이미지 보정은 CPU에서 실행됩니다.')
+        ocr_note = QLabel('Comic Text Detector와 글자 인식은 선택한 OCR 장치에서 실행됩니다. OpenCV 후보 감지·이미지 보정은 CPU를 사용합니다.')
         ocr_note.setWordWrap(True)
         layout.addWidget(ocr_note)
         self.translation_mode = QComboBox()
@@ -753,7 +797,7 @@ class Controller(QWidget):
         self.api_key_save_timer.setInterval(500)
         self.api_key_save_timer.timeout.connect(self.change_device)
         self.source_language = QComboBox()
-        self.source_language.setToolTip('영역 감지·이미지 보정은 OpenCV, 자동 언어 판별은 EasyOCR를 사용합니다. 일본어는 Manga OCR, 영어는 TrOCR로 읽고 실패하거나 불확실하면 EasyOCR를 사용합니다.')
+        self.source_language.setToolTip('자동 언어 판별은 EasyOCR를 사용합니다. 일본어는 Manga OCR, 영어는 TrOCR로 읽고 실패하거나 불확실하면 EasyOCR를 사용합니다.')
         for code, label in SOURCE_LANGUAGES.items():
             self.source_language.addItem(label, code)
         self.source_language.setCurrentIndex(self.source_language.findData(initial_language))
@@ -872,7 +916,14 @@ class Controller(QWidget):
         self.detection_mode.setCurrentIndex(self.detection_mode.findData(initial_ui['detection_size']))
         self.engine.detector_size = initial_ui['detection_size']
         self.detection_mode.currentIndexChanged.connect(self.change_detection_mode)
-        add_setting('감지 해상도',self.detection_mode,2,0,2)
+        self.detection_method = QComboBox()
+        for key, label in DETECTION_METHODS.items():
+            self.detection_method.addItem(label, key)
+        self.detection_method.setCurrentIndex(self.detection_method.findData(initial_ui['detection_method']))
+        self.detection_method.setToolTip('Comic Text Detector는 만화 텍스트 블록을 감지합니다. OpenCV (기존 방식)를 선택하면 이전 감지 방식으로 돌아갑니다.')
+        self.detection_method.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
+        add_setting('영역 감지', self.detection_method, 2, 0)
+        add_setting('감지 해상도',self.detection_mode,2,1)
         self.text_style_panel = QWidget()
         style_form = QFormLayout(self.text_style_panel)
         style_form.setContentsMargins(0,0,0,0)
@@ -903,7 +954,7 @@ class Controller(QWidget):
         self.status.setWordWrap(True)
         self.main_layout.addWidget(self.status)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 4)
+        self.progress_bar.setRange(0, 5 if initial_ui['detection_method'] == 'comic' else 4)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('OCR 로딩 대기')
         self.progress_bar.setMinimumHeight(22)
@@ -965,7 +1016,7 @@ class Controller(QWidget):
         self.apply_selected_window_theme()
         self.set_interface_mode(initial_ui['interface_mode'])
         self.restoring_settings = False
-        for control in (self.screens, self.device_mode, self.detection_mode):
+        for control in (self.screens, self.device_mode, self.detection_mode, self.detection_method):
             control.currentIndexChanged.connect(self.save_current_ui_settings)
         for control in (self.manual, self.always_on_top):
             control.toggled.connect(self.save_current_ui_settings)
@@ -978,6 +1029,7 @@ class Controller(QWidget):
             'monitor': self.screens.currentText(), 'interface_mode': self.interface_mode,
             'always_on_top': self.always_on_top.isChecked(), 'device': self.device_mode.currentData(),
             'detection_size': self.detection_mode.currentData(),
+            'detection_method': self.detection_method.currentData(),
             'single_balloon': self.manual.isChecked(),
         }
         try:
@@ -1226,6 +1278,7 @@ class Controller(QWidget):
     def translation_is_current(self):
         return (self.worker_ready and not self.engine.stop_event.is_set()
                 and self.engine.device == self.device_mode.currentData()
+                and self.engine.detection_method == self.detection_method.currentData()
                 and self.engine.source_language == self.source_language.currentData()
                 and self.engine.provider == self.translation_mode.currentData()
                 and self.engine.api_key == self.selected_api_key()
@@ -1326,13 +1379,15 @@ class Controller(QWidget):
             return
         if not self.save_api_key():
             return
-        if self.translation_mode.currentData() == 'openai':
+        ocr_changed = (self.engine.detection_method != self.detection_method.currentData()
+                       or self.engine.device != self.device_mode.currentData())
+        if self.translation_mode.currentData() == 'openai' and not ocr_changed:
             try:
                 validate_openai_settings(*self.selected_openai_settings(), self.selected_api_key())
             except ValueError as exc:
                 self.status.setText(str(exc))
                 return
-        elif not self.selected_api_key():
+        elif self.translation_mode.currentData() != 'openai' and not self.selected_api_key() and not ocr_changed:
             self.status.setText('선택한 번역 서비스의 API 키가 필요합니다. 키를 입력하면 자동으로 적용됩니다.')
             return
         if self.translation_is_current() and self.engine.is_alive():
@@ -1341,6 +1396,7 @@ class Controller(QWidget):
         self.worker_ready = False
         self.reset_for_settings()
         self.pending_device = self.device_mode.currentData()
+        self.pending_detection_method = self.detection_method.currentData()
         self.pending_source_language = self.source_language.currentData()
         self.pending_api_key = self.selected_api_key()
         self.pending_provider = self.translation_mode.currentData()
@@ -1353,6 +1409,7 @@ class Controller(QWidget):
         self.signals.finished.disconnect(self.frame_finished)
         self.signals.progress.disconnect(self.update_progress)
         self.device_mode.setEnabled(False)
+        self.detection_method.setEnabled(False)
         self.source_language.setEnabled(False)
         self.api_key.setEnabled(False)
         self.deepl_api_key.setEnabled(False)
@@ -1372,6 +1429,7 @@ class Controller(QWidget):
         models = self.engine.ocr_models if self.engine.device == self.pending_device else None
         self.signals = Signals()
         self.engine = Engine(self.signals, device=self.pending_device,
+                             detection_method=self.pending_detection_method,
                              api_key=self.pending_api_key, provider=self.pending_provider,
                              base_url=self.pending_base_url, model=self.pending_model,
                              io_logger=self.io_logger, source_language=self.pending_source_language,
@@ -1381,6 +1439,7 @@ class Controller(QWidget):
         self.engine.detector_size = self.detection_mode.currentData()
         self.connect_engine()
         self.device_mode.setEnabled(True)
+        self.detection_method.setEnabled(True)
         self.source_language.setEnabled(True)
         self.api_key.setEnabled(True)
         self.deepl_api_key.setEnabled(True)

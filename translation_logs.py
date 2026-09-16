@@ -12,7 +12,7 @@ LEGACY_LOG_NAME = re.compile(r'(?:input|output)-(\d{4}-\d{2}-\d{2})\.jsonl')
 
 
 class TranslationLogs:
-    def __init__(self, directory, retention_days=7):
+    def __init__(self, directory, retention_days=3):
         self.directory = Path(directory)
         if type(retention_days) is not int or retention_days < 1:
             raise ValueError('로그 보관 기간은 1일 이상이어야 합니다.')
