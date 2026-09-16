@@ -16,6 +16,7 @@ class VersionUpdater(QObject):
     checked = pyqtSignal(object,str,bool)
     downloaded = pyqtSignal(object,str)
     progress = pyqtSignal(int)
+    progress_changed = pyqtSignal(int, int, str)
 
     def __init__(self, parent, home):
         super().__init__(parent)
@@ -47,7 +48,13 @@ class VersionUpdater(QObject):
         self.initial_timer.timeout.connect(self.check)
         self.checked.connect(self.finished_check)
         self.downloaded.connect(self.finished_download)
-        self.progress.connect(lambda value:self.label.setText(f'업데이트 다운로드 · {value}%'))
+        self.progress.connect(self.show_download_progress)
+
+    def show_download_progress(self, value):
+        if self.closed.is_set():
+            return
+        self.label.setText('업데이트 다운로드 중…')
+        self.progress_changed.emit(max(0, min(100, value)), 100, '업데이트 다운로드 · %p%')
 
     def start(self):
         self.timer.start()
@@ -113,14 +120,14 @@ class VersionUpdater(QObject):
             try:
                 pending = read_pending(self.home)
                 if pending and pending[0]['sha256']==result['sha256']:
-                    self.label.setText('v'+result['version']+' · 다음 실행에 적용')
+                    self.finished_download(result, '')
                     return
             except (OSError,ValueError,KeyError,TypeError):
                 pass
         if target is None:
             message = f'새 버전 v{result["version"]}이 있습니다.\n소스 실행에서는 릴리스 페이지에서 새 EXE를 받아 주세요.\n릴리스 페이지를 열까요?'
         else:
-            message = f'새 버전 v{result["version"]}을 다운로드할까요?\n설정과 API 키는 유지되며, 다음 실행부터 적용됩니다.'
+            message = f'새 버전 v{result["version"]}을 다운로드할까요?\n완료되면 프로그램이 자동으로 재시작됩니다. 설정과 API 키는 유지됩니다.'
         if QMessageBox.question(self.parent(),'업데이트 가능',message,
             QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.Yes)!=QMessageBox.StandardButton.Yes:
             return
@@ -129,7 +136,7 @@ class VersionUpdater(QObject):
             return
         self.busy = True
         self.button.setEnabled(False)
-        self.label.setText('업데이트 다운로드 중…')
+        self.show_download_progress(0)
         def worker():
             error = ''
             last = [-1]
@@ -154,15 +161,32 @@ class VersionUpdater(QObject):
         self.busy = False
         self.button.setEnabled(True)
         if error:
+            self.progress_changed.emit(0, 0, '')
             self.label.setText('업데이트 실패 · 버전 확인으로 재시도')
             QMessageBox.warning(self.parent(),'업데이트',error)
             return
-        note = ''
         try:
             updates.save_state(self.home,{'pending_version':result['version']})
         except (OSError,ValueError):
-            note = '\n업데이트 기록을 저장하지 못했지만 새 실행 파일은 준비되었습니다.'
             log.warning('Pending version could not be saved',exc_info=True)
-        self.label.setText('v'+result['version']+' · 다음 실행에 적용')
-        QMessageBox.information(self.parent(),'업데이트 완료',
-            '새 실행 파일을 준비했습니다. 프로그램을 종료한 뒤 평소처럼 실행하면 새 버전이 적용됩니다.'+note)
+        self.busy = True
+        self.button.setEnabled(False)
+        self.label.setText('v'+result['version']+' · 재시작 중…')
+        self.progress_changed.emit(100, 100, '업데이트 다운로드 완료 · 재시작 중…')
+        try:
+            from self_update import handoff_pending
+            if not handoff_pending(self.home):
+                raise ValueError('적용할 업데이트 파일이 없습니다.')
+        except Exception as exc:
+            detail = updates.error_detail(exc)
+            log.warning('Update restart failed (%s): %s',type(exc).__name__,detail)
+            self.busy = False
+            self.button.setEnabled(True)
+            self.progress_changed.emit(0, 0, '')
+            self.label.setText('업데이트 재시작 실패 · 버전 확인으로 재시도')
+            QMessageBox.warning(self.parent(),'업데이트',
+                '자동 재시작을 준비하지 못했습니다. '+detail+' 현재 프로그램은 유지됩니다.')
+            return
+        # The verified helper waits for this EXE to exit before replacing it.
+        # Closing the main window saves settings and stops capture/OCR workers.
+        self.parent().close()

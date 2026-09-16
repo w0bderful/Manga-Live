@@ -960,6 +960,8 @@ class Controller(QWidget):
         self.progress_bar.setRange(0, 5 if initial_ui['detection_method'] == 'comic' else 4)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('OCR 로딩 대기')
+        self.task_progress = (0, self.progress_bar.maximum(), 'OCR 로딩 대기')
+        self.release_progress = None
         self.progress_bar.setMinimumHeight(22)
         self.main_layout.addWidget(self.progress_bar)
         self.capture_note = QLabel('')
@@ -1001,6 +1003,7 @@ class Controller(QWidget):
         self.resource_note.setToolTip('현재 프로그램의 사용량입니다. CPU는 전체 논리 코어 기준, GPU는 가장 바쁜 엔진 기준, VRAM은 전용 GPU 메모리입니다. 조회 불가는 드라이버가 정보를 제공하지 않는 경우입니다.')
         self.main_layout.addWidget(self.resource_note)
         self.version_updates = VersionUpdater(self, ROOT)
+        self.version_updates.progress_changed.connect(self.update_release_progress)
         self.main_layout.addWidget(self.version_updates.panel)
         self.resource_monitor = ResourceMonitor()
         self.resource_monitor.start()
@@ -1194,9 +1197,21 @@ class Controller(QWidget):
             return
         if generation != -1 and (not self.running or generation != engine.generation):
             return
+        self.set_task_progress(done, total, f'{label} · %v/%m (%p%)' if total > 1 else label)
+
+    def set_task_progress(self, done, total, label):
+        self.task_progress = (done, total, label)
+        self.render_progress()
+
+    def update_release_progress(self, done, total, label):
+        self.release_progress = (done, total, label) if label else None
+        self.render_progress()
+
+    def render_progress(self):
+        done, total, label = self.release_progress or self.task_progress
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(done)
-        self.progress_bar.setFormat(f'{label} · %v/%m (%p%)' if total > 1 else label)
+        self.progress_bar.setFormat(label)
 
     def update_model_download(self, engine, info):
         if engine is not self.engine or engine.stop_event.is_set():
@@ -1204,15 +1219,12 @@ class Controller(QWidget):
         from model_downloads import download_label
         _, received, total = info
         label = download_label(info)
-        self.progress_bar.setRange(0, 1000 if total else 0)
-        self.progress_bar.setValue(min(1000, int(received * 1000 / total)) if total else 0)
-        self.progress_bar.setFormat(label + (' (%p%)' if total else ''))
+        self.set_task_progress(min(1000, int(received * 1000 / total)) if total else 0,
+                               1000 if total else 0, label + (' (%p%)' if total else ''))
         self.status.setText(label)
 
     def stop_progress(self, label):
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat(label)
+        self.set_task_progress(0, 1, label)
 
     def set_always_on_top(self, enabled):
         visible = self.isVisible()
@@ -1471,9 +1483,7 @@ class Controller(QWidget):
                 or engine.provider != self.translation_mode.currentData()):
             return
         self.worker_ready = False
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(1)
-        self.progress_bar.setFormat('OCR 준비 완료 · API 키 입력 대기')
+        self.set_task_progress(1, 1, 'OCR 준비 완료 · API 키 입력 대기')
         self.status.setText('선택한 번역 서비스의 API 키를 입력하세요. 입력 후 자동으로 적용됩니다.')
 
     def ready(self):
