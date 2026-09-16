@@ -101,6 +101,7 @@ class Signals(QObject):
     finished = pyqtSignal(int)
     progress = pyqtSignal(object, int, int, int, str)
     model_download = pyqtSignal(object, object)
+    api_key_required = pyqtSignal(object)
 
 
 class Engine(threading.Thread):
@@ -249,7 +250,7 @@ class Engine(threading.Thread):
                     download_progress=lambda info: self.signals.model_download.emit(self, info)):
                 return
             if self.provider != 'openai' and not self.api_key.strip():
-                self.signals.failed.emit(self, self.generation, '선택한 번역 서비스의 API 키를 입력하세요. 입력 후 자동으로 적용됩니다.')
+                self.signals.api_key_required.emit(self)
                 return
             with asyncio.Runner() as runner:
                 async def work():
@@ -1179,6 +1180,7 @@ class Controller(QWidget):
             self.hotkey_dialog_open = False
 
     def connect_engine(self):
+        self.signals.api_key_required.connect(self.wait_for_api_key)
         self.signals.model_download.connect(self.update_model_download)
         self.signals.progress.connect(self.update_progress)
         self.signals.status.connect(self.status.setText)
@@ -1405,9 +1407,6 @@ class Controller(QWidget):
             except ValueError as exc:
                 self.status.setText(str(exc))
                 return
-        elif self.translation_mode.currentData() != 'openai' and not self.selected_api_key() and not ocr_changed:
-            self.status.setText('선택한 번역 서비스의 API 키가 필요합니다. 키를 입력하면 자동으로 적용됩니다.')
-            return
         if self.translation_is_current() and self.engine.is_alive():
             self.status.setText('이미 적용된 설정입니다.')
             return
@@ -1427,6 +1426,7 @@ class Controller(QWidget):
         self.signals.finished.disconnect(self.frame_finished)
         self.signals.progress.disconnect(self.update_progress)
         self.signals.model_download.disconnect(self.update_model_download)
+        self.signals.api_key_required.disconnect(self.wait_for_api_key)
         self.device_mode.setEnabled(False)
         self.detection_method.setEnabled(False)
         self.source_language.setEnabled(False)
@@ -1465,6 +1465,16 @@ class Controller(QWidget):
         self.translation_mode.setEnabled(True)
         self.openai_panel.setEnabled(True)
         self.engine.start()
+
+    def wait_for_api_key(self, engine):
+        if (engine is not self.engine or engine.stop_event.is_set()
+                or engine.provider != self.translation_mode.currentData()):
+            return
+        self.worker_ready = False
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.progress_bar.setFormat('OCR 준비 완료 · API 키 입력 대기')
+        self.status.setText('선택한 번역 서비스의 API 키를 입력하세요. 입력 후 자동으로 적용됩니다.')
 
     def ready(self):
         if (self.engine.stop_event.is_set()
