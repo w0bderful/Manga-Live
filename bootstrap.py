@@ -106,8 +106,18 @@ def download(asset, cache, cancel, progress, opener=urllib.request.urlopen):
 
 
 def installed(directory, manifest, cancel, progress):
-    if not (directory/'.complete').is_file():
+    identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:24]
+    try:
+        complete = (directory/'.complete').read_text(encoding='ascii') == identity
+    except (OSError, ValueError):
+        complete = False
+    if not complete or not safe_path(directory, manifest['entrypoint']).is_file():
         return False
+    # A successful install is trusted on normal launches. Only an incomplete
+    # previous startup requests the expensive full-file verification again.
+    pending = directory/'.startup-pending'
+    if not pending.exists():
+        return True
     for index, (name, expected) in enumerate(manifest['files'].items()):
         check_cancel(cancel)
         path = safe_path(directory, name)
@@ -115,6 +125,7 @@ def installed(directory, manifest, cancel, progress):
                 or checksum(path, cancel) != expected['sha256']):
             return False
         progress('설치된 파일 확인 중', (index+1)/len(manifest['files'])*100)
+    pending.unlink(missing_ok=True)
     return True
 
 
@@ -240,11 +251,23 @@ def activate_runtime(entrypoint, home):
 
 
 def launch(entrypoint, home):
+    pending = entrypoint.parent.parent/'.startup-pending'
+    pending.write_text('starting', encoding='ascii')
     activate_runtime(entrypoint, home)
     multiprocessing.freeze_support()
     import importlib
     application = importlib.import_module('main')
-    return application.main()
+    import inspect
+    if 'on_ready' in inspect.signature(application.main).parameters:
+        return application.main(on_ready=lambda: pending.unlink(missing_ok=True))
+    # Reused older runtimes have no ready callback. Imports succeeded; still
+    # request verification if their entrypoint raises during startup.
+    pending.unlink(missing_ok=True)
+    try:
+        return application.main()
+    except Exception:
+        pending.write_text('failed', encoding='ascii')
+        raise
 
 
 def main():

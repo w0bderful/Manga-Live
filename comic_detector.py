@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from core import Box
+from model_downloads import DownloadReporter
 
 MODEL_NAME = 'comictextdetector.pt.onnx'
 MODEL_URL = ('https://github.com/zyddnys/manga-image-translator/releases/download/'
@@ -32,7 +33,7 @@ def valid_model(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest() == MODEL_SHA256
 
 
-def model_path(root, status, stopped):
+def model_path(root, status, stopped, download_progress=None):
     path = Path(root) / '.models' / 'comic-text-detector' / MODEL_NAME
     check_stopped(stopped)
     if valid_model(path):
@@ -40,6 +41,8 @@ def model_path(root, status, stopped):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.onnx.part')
     status('Comic Text Detector 모델 다운로드 중…')
+    reporter = DownloadReporter('Comic Text Detector', download_progress, stopped)
+    reporter.report(0, MODEL_SIZE, force=True)
     try:
         request = urllib.request.Request(MODEL_URL, headers={'User-Agent': 'Manga-Live'})
         with urllib.request.urlopen(request, timeout=15) as response, temporary.open('wb') as stream:
@@ -53,6 +56,7 @@ def model_path(root, status, stopped):
                 if received > MODEL_SIZE:
                     raise ValueError('모델 파일 크기가 예상과 다릅니다.')
                 stream.write(chunk)
+                reporter.report(received, MODEL_SIZE)
                 status(f'Comic Text Detector 다운로드 · {received * 100 // MODEL_SIZE}%')
         check_stopped(stopped)
         if not valid_model(temporary):
@@ -266,12 +270,12 @@ def cuda_session(path):
 
 
 class ComicTextDetector:
-    def __init__(self, root, status=lambda _: None, stopped=lambda: False, *, device='cpu'):
+    def __init__(self, root, status=lambda _: None, stopped=lambda: False, *, device='cpu', download_progress=None):
         if device not in ('cpu', 'cuda'):
             raise ValueError('지원하지 않는 CTD 실행 장치입니다.')
         self.device = device
         self.session = None
-        path = model_path(root, status, stopped)
+        path = model_path(root, status, stopped, download_progress)
         check_stopped(stopped)
         status(f'Comic Text Detector {"GPU" if device == "cuda" else "CPU"} 모델 로딩 중…')
         if device == 'cuda':

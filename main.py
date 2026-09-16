@@ -100,6 +100,7 @@ class Signals(QObject):
     failed = pyqtSignal(object, int, str)
     finished = pyqtSignal(int)
     progress = pyqtSignal(object, int, int, int, str)
+    model_download = pyqtSignal(object, object)
 
 
 class Engine(threading.Thread):
@@ -244,7 +245,8 @@ class Engine(threading.Thread):
         try:
             if not self.ocr_models.preload(self.signals.status.emit, self.stop_event.is_set,
                     lambda done, total, label: self.signals.progress.emit(self, -1, done, total, label),
-                    detection_method=self.detection_method):
+                    detection_method=self.detection_method,
+                    download_progress=lambda info: self.signals.model_download.emit(self, info)):
                 return
             if self.provider != 'openai' and not self.api_key.strip():
                 self.signals.failed.emit(self, self.generation, '선택한 번역 서비스의 API 키를 입력하세요. 입력 후 자동으로 적용됩니다.')
@@ -1177,6 +1179,7 @@ class Controller(QWidget):
             self.hotkey_dialog_open = False
 
     def connect_engine(self):
+        self.signals.model_download.connect(self.update_model_download)
         self.signals.progress.connect(self.update_progress)
         self.signals.status.connect(self.status.setText)
         self.signals.failed.connect(self.processing_failed)
@@ -1192,6 +1195,17 @@ class Controller(QWidget):
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(done)
         self.progress_bar.setFormat(f'{label} · %v/%m (%p%)' if total > 1 else label)
+
+    def update_model_download(self, engine, info):
+        if engine is not self.engine or engine.stop_event.is_set():
+            return
+        from model_downloads import download_label
+        _, received, total = info
+        label = download_label(info)
+        self.progress_bar.setRange(0, 1000 if total else 0)
+        self.progress_bar.setValue(min(1000, int(received * 1000 / total)) if total else 0)
+        self.progress_bar.setFormat(label + (' (%p%)' if total else ''))
+        self.status.setText(label)
 
     def stop_progress(self, label):
         self.progress_bar.setRange(0, 1)
@@ -1412,6 +1426,7 @@ class Controller(QWidget):
         self.signals.result.disconnect(self.accept_result)
         self.signals.finished.disconnect(self.frame_finished)
         self.signals.progress.disconnect(self.update_progress)
+        self.signals.model_download.disconnect(self.update_model_download)
         self.device_mode.setEnabled(False)
         self.detection_method.setEnabled(False)
         self.source_language.setEnabled(False)
@@ -1755,7 +1770,7 @@ def configure_logging():
     return ''
 
 
-def main():
+def main(on_ready=None):
     if sys.platform != 'win32':
         raise SystemExit('이 프로그램은 Windows 전용입니다.')
     logging_warning = configure_logging()
@@ -1776,6 +1791,8 @@ def main():
         note.setWordWrap(True)
         window.layout().addWidget(note)
     window.show()
+    if on_ready is not None:
+        on_ready()
     return app.exec()
 
 

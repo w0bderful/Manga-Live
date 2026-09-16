@@ -18,6 +18,19 @@ def digest(path):
         return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 
+def reusable_runtime(manifest_path, records):
+    if not manifest_path.is_file():
+        return None
+    try:
+        previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if (isinstance(previous, dict) and previous.get('entrypoint') == '_internal/main.py'
+            and previous.get('files') == records and previous.get('assets')):
+        return previous
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--launcher-only', action='store_true', help='기존 매니페스트로 실행기만 다시 빌드')
@@ -44,6 +57,12 @@ def main():
     forbidden = {'api-keys.json','settings.json','.env','AGENTS.md'}
     if any(p.name in forbidden or p.suffix == '.log' for p,_ in files):
         raise ValueError('배포에 포함할 수 없는 파일이 있습니다.')
+    records = {name: {'size':path.stat().st_size, 'sha256':digest(path)} for path,name in files}
+    manifest_path = work/'runtime-manifest.json'
+    if reusable_runtime(manifest_path, records) is not None:
+        print('런타임 내용 변경 없음: 기존 다운로드 주소를 재사용합니다. 런타임 재업로드는 필요하지 않습니다.', flush=True)
+        build_launcher(manifest_path, output, work)
+        return
     groups, current, total = [], [], 0
     for path, name in files:
         size = path.stat().st_size
@@ -58,10 +77,10 @@ def main():
     def package(index):
         name = f'Manga-Live-runtime-{index+1:03}.zip'
         target = output/name
-        records = {}
+        group_records = {}
         with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
             for path, member in groups[index]:
-                records[member] = {'size':path.stat().st_size, 'sha256':digest(path)}
+                group_records[member] = records[member]
                 archive.write(path,member)
         if target.stat().st_size >= 2*1024**3:
             raise ValueError('GitHub 릴리스 파일 크기 제한 초과')
@@ -70,14 +89,13 @@ def main():
                 raise ValueError('ZIP 검증 실패')
         print(f'검증 완료: {name} ({target.stat().st_size} bytes)',flush=True)
         return {'name':name,'url':args.asset_base_url.rstrip('/')+'/'+name,
-                'size':target.stat().st_size,'sha256':digest(target)}, records
+                'size':target.stat().st_size,'sha256':digest(target)}, group_records
 
     manifest = {'entrypoint':'_internal/main.py','assets':[],'files':{}}
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for asset, records in pool.map(package,range(len(groups))):
+        for asset, group_records in pool.map(package,range(len(groups))):
             manifest['assets'].append(asset)
-            manifest['files'].update(records)
-    manifest_path = work/'runtime-manifest.json'
+            manifest['files'].update(group_records)
     manifest_path.write_text(json.dumps(manifest,ensure_ascii=False,sort_keys=True),encoding='utf-8')
     build_launcher(manifest_path,output,work)
 
