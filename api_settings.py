@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 from uuid import uuid4
+from app_settings import read_settings, update_settings
 
 ROOT = Path(__file__).resolve().parent
 API_KEYS_FILE = ROOT / 'api-keys.json'
@@ -49,8 +50,7 @@ def read_key_file(path, fields, recover=False, required=False):
 
 
 def migrate_keys(recover=False, provider=None):
-    data = (read_key_file(API_KEYS_FILE, [field for field, _ in FIELDS.values()] +
-                          ['openai_base_url', 'openai_model', 'translation_provider'], recover=True)
+    data = (read_key_file(API_KEYS_FILE, [field for field, _ in FIELDS.values()], recover=True)
             if recover else read_keys(API_KEYS_FILE))
     migrated = []
     for service, (field, env_name) in FIELDS.items():
@@ -86,7 +86,7 @@ def load_api_key(provider='luna'):
 
 
 def load_openai_settings():
-    data = read_keys(API_KEYS_FILE)
+    data = read_settings(API_KEYS_FILE.with_name('settings.json'))
     result = {}
     for name, default in OPENAI_DEFAULTS.items():
         value = data.get('openai_' + name, default)
@@ -97,7 +97,8 @@ def load_openai_settings():
 
 
 def load_translation_provider():
-    provider = read_keys(API_KEYS_FILE).get('translation_provider', 'luna')
+    data = read_settings(API_KEYS_FILE.with_name('settings.json'))
+    provider = data.get('translation_provider', 'luna')
     return provider if isinstance(provider, str) and provider in FIELDS else 'luna'
 
 
@@ -107,10 +108,14 @@ def save_api_keys(kie_key, deepl_key, *, openai_key=None, openai_base_url=None, 
         raise ValueError('지원하지 않는 번역 서비스입니다.')
     data = migrate_keys(recover=True)
     data.update(kie_api_key=kie_key.strip(), deepl_api_key=deepl_key.strip())
-    for field, value in [('openai_api_key', openai_key), ('openai_base_url', openai_base_url),
-                         ('openai_model', openai_model)]:
+    if openai_key is not None:
+        data['openai_api_key'] = openai_key.strip()
+    preferences = {}
+    for name, value in [('openai_base_url', openai_base_url), ('openai_model', openai_model),
+                        ('translation_provider', translation_provider)]:
         if value is not None:
-            data[field] = value.strip()
-    if translation_provider is not None:
-        data['translation_provider'] = translation_provider
-    write_keys(data)
+            preferences[name] = value.strip()
+    if preferences:
+        update_settings(preferences, API_KEYS_FILE.with_name('settings.json'))
+    write_keys({name: value for name, value in data.items()
+                if name not in ('openai_base_url', 'openai_model', 'translation_provider')})

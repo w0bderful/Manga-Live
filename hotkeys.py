@@ -1,19 +1,17 @@
 """Windows global shortcuts and their local settings dialog."""
 import ctypes
 from ctypes import wintypes
-import json
-from pathlib import Path
 
 from PyQt6.QtCore import QAbstractNativeEventFilter, Qt, QTimer
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFormLayout,
                             QHBoxLayout, QKeySequenceEdit, QLabel, QPushButton,
                             QVBoxLayout, QWidget)
+from app_settings import SETTINGS_FILE, read_settings, update_settings
 
 ACTIONS = {'select': '영역 선택', 'drag': '드래그 번역',
            'toggle': '번역 시작 / 일시정지 / 취소', 'retry': '다시 번역'}
 DEFAULTS = dict(zip(ACTIONS, ('Ctrl+Alt+1', 'Ctrl+Alt+2', 'Ctrl+Alt+3', 'Ctrl+Alt+4')))
-SETTINGS_FILE = Path(__file__).resolve().parent / 'hotkeys.json'
 WM_HOTKEY = 0x0312
 MOD_NOREPEAT = 0x4000
 
@@ -77,16 +75,12 @@ def validate_settings(settings):
 
 
 def load_settings(path=SETTINGS_FILE):
-    if not path.exists():
-        return dict(DEFAULTS)
-    return validate_settings(json.loads(path.read_text(encoding='utf-8')))[0]
+    return validate_settings(read_settings(path).get('hotkeys', {}))[0]
 
 
 def save_settings(settings, path=SETTINGS_FILE):
     normalized, _ = validate_settings(settings)
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    temporary.replace(path)
+    update_settings({'hotkeys': normalized}, path)
 
 
 class WindowsHotkeys(QAbstractNativeEventFilter):

@@ -3,6 +3,7 @@ import logging
 import cv2
 import numpy as np
 from core import Box, text_boxes
+from app_settings import validate_source_language
 
 MODES = {
     'manga_ocr': 'Manga OCR (EasyOCR 감지 + Manga OCR 인식)',
@@ -49,21 +50,23 @@ def opencv_boxes(pixels, canvas_size=None):
 
 
 class OcrBackend:
-    def __init__(self, mode, device, root):
+    def __init__(self, mode, device, root, source_language='ja'):
         if mode not in MODES:
             raise ValueError('지원하지 않는 OCR 모드입니다.')
+        self.source_language = validate_source_language(source_language)
+        self.use_easyocr = mode == 'easyocr' or source_language != 'ja'
+        self.languages = ['en'] if source_language == 'en' else ['ja', 'en']
         self.mode = mode
         self.reader = None
         self.mocr = None
         self.device = device
         self.root = Path(root)
-        root = Path(root)
-        if mode != 'opencv':
+        if mode != 'opencv' or self.use_easyocr:
             import easyocr
-            self.reader = easyocr.Reader(['ja', 'en'], gpu=(device == 'cuda'),
-                recognizer=(mode == 'easyocr'), model_storage_directory=str(root/'.models'/'easyocr'),
-                user_network_directory=str(root/'.models'/'easyocr'/'user'))
-        if mode != 'easyocr':
+            self.reader = easyocr.Reader(self.languages, gpu=(device == 'cuda'),
+                recognizer=self.use_easyocr, model_storage_directory=str(self.root/'.models'/'easyocr'),
+                user_network_directory=str(self.root/'.models'/'easyocr'/'user'))
+        if not self.use_easyocr:
             from manga_ocr import MangaOcr
             self.mocr = MangaOcr(force_cpu=(device == 'cpu'))
             self.mocr.model.to(device)
@@ -81,7 +84,7 @@ class OcrBackend:
                 return boxes
             if self.reader is None:
                 import easyocr
-                self.reader = easyocr.Reader(['ja', 'en'], gpu=(self.device == 'cuda'),
+                self.reader = easyocr.Reader(self.languages, gpu=(self.device == 'cuda'),
                     recognizer=False, model_storage_directory=str(self.root/'.models'/'easyocr'),
                     user_network_directory=str(self.root/'.models'/'easyocr'/'user'))
             recovered = self.detect_craft(pixels, canvas_size)
@@ -107,7 +110,7 @@ class OcrBackend:
         return text_boxes(horizontal, free, width, height)
 
     def recognize(self, crop):
-        if self.mode == 'easyocr':
+        if self.use_easyocr:
             parts = self.reader.recognize(np.asarray(crop.convert('RGB')), detail=0, paragraph=True)
             return ' '.join(parts).strip()
         return self.mocr(crop).strip()

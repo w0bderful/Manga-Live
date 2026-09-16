@@ -1,7 +1,4 @@
-import json
-from pathlib import Path
-
-SETTINGS_FILE = Path(__file__).resolve().parent / 'overlay-settings.json'
+from app_settings import SETTINGS_FILE, read_settings, update_settings
 DEFAULT_OPACITY = 100
 
 
@@ -12,16 +9,9 @@ def validate_opacity(value):
 
 
 def load_opacity(path=SETTINGS_FILE):
-    if not path.exists():
-        return DEFAULT_OPACITY
-    data = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(data, dict):
-        raise ValueError('배경 설정은 JSON 객체여야 합니다.')
+    data = read_settings(path)
     return validate_opacity(data.get('background_opacity', DEFAULT_OPACITY))
 
 
 def save_opacity(value, path=SETTINGS_FILE):
-    data = {'background_opacity': validate_opacity(value)}
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
-    temporary.replace(path)
+    update_settings({'background_opacity': validate_opacity(value)}, path)

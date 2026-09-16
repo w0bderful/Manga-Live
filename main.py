@@ -34,6 +34,8 @@ from window_capture import CaptureWithoutApp, CaptureProtectionError
 from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
 from overlay_settings import DEFAULT_OPACITY, load_opacity, save_opacity
 from translation_logs import TranslationLogs, DailyRuntimeLogHandler
+from app_settings import (SOURCE_LANGUAGES, DEFAULT_SOURCE_LANGUAGE, load_source_language,
+                          save_source_language, validate_source_language)
 
 log = logging.getLogger(__name__)
 
@@ -91,11 +93,12 @@ class Signals(QObject):
 class Engine(threading.Thread):
 
     def __init__(self, signals, device='cpu', ocr_mode='manga_ocr', api_key='', provider='luna',
-                 base_url='', model='', io_logger=None):
+                 base_url='', model='', io_logger=None, source_language='ja'):
         super().__init__(daemon=True)
         self.signals = signals
         self.device = device
         self.ocr_mode = ocr_mode
+        self.source_language = validate_source_language(source_language)
         self.api_key = api_key
         self.provider = provider
         self.base_url, self.model = base_url, model
@@ -139,7 +142,8 @@ class Engine(threading.Thread):
                     self.ocr_cache.popitem(last=False)
             if self.stop_event.is_set() or generation < self.cancel_before:
                 break
-            if not re.search(r'[\u3040-\u30ff\u3400-\u9fff]', source):
+            pattern = r'[\u3040-\u30ff\u3400-\u9fff]' if self.source_language == 'ja' else r'[A-Za-z\u3040-\u30ff\u3400-\u9fff]'
+            if not re.search(pattern, source):
                 continue
             self.signals.status.emit(f'{TRANSLATION_MODES[self.provider]} 응답 대기 중… {i+1}/{len(boxes)}')
             translated = await self.translate(client, source)
@@ -168,7 +172,7 @@ class Engine(threading.Thread):
                 self.cache.move_to_end(text)
                 translated = self.cache[text]
             else:
-                result = await client.translate(text, src='ja', dest='ko')
+                result = await client.translate(text, src=self.source_language, dest='ko')
                 translated = result.text.strip()
                 if not translated:
                     raise RuntimeError('빈 번역 결과')
@@ -207,7 +211,7 @@ class Engine(threading.Thread):
                                     import torch
                                     validate_device(self.device)
                                     self.signals.status.emit(f'{MODES[self.ocr_mode]} 첫 로딩 중…')
-                                    backend = OcrBackend(self.ocr_mode, self.device, ROOT)
+                                    backend = OcrBackend(self.ocr_mode, self.device, ROOT, self.source_language)
                                 if not self.valid(generation):
                                     continue
                                 self.signals.status.emit('글자 영역 감지 중…')
@@ -479,7 +483,7 @@ class Controller(QWidget):
     def __init__(self, io_logger=None):
         super().__init__()
         self.io_logger = io_logger
-        self.setWindowTitle('Manga Live · 일본어 → 한국어')
+        self.setWindowTitle('Manga Live · 화면 → 한국어')
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
@@ -520,9 +524,16 @@ class Controller(QWidget):
             initial_provider = 'luna'
         initial_keys = {'luna': initial_api_key, 'deepl': initial_deepl_api_key,
                         'openai': initial_openai_api_key}
+        language_error = ''
+        try:
+            initial_language = load_source_language()
+        except (OSError, ValueError):
+            initial_language = DEFAULT_SOURCE_LANGUAGE
+            language_error = '원문 언어 설정을 읽지 못해 일본어를 사용합니다. settings.json을 확인하세요.'
         self.engine = Engine(self.signals, device='cuda', api_key=initial_keys[initial_provider],
                              provider=initial_provider, base_url=initial_openai_settings['base_url'],
-                             model=initial_openai_settings['model'], io_logger=self.io_logger)
+                             model=initial_openai_settings['model'], io_logger=self.io_logger,
+                             source_language=initial_language)
         self.main_layout = layout = QVBoxLayout(self)
         self.menu_bar = QMenuBar(self)
         self.menu_bar.setNativeMenuBar(False)
@@ -583,6 +594,18 @@ class Controller(QWidget):
         self.api_key_save_timer.setSingleShot(True)
         self.api_key_save_timer.setInterval(500)
         self.api_key_save_timer.timeout.connect(self.change_device)
+        layout.addWidget(QLabel('원문 언어'))
+        self.source_language = QComboBox()
+        self.source_language.setToolTip('자동 감지는 일본어·영어 원문을 인식합니다. 자동 감지·영어는 EasyOCR로 글자를 읽습니다.')
+        for code, label in SOURCE_LANGUAGES.items():
+            self.source_language.addItem(label, code)
+        self.source_language.setCurrentIndex(self.source_language.findData(initial_language))
+        layout.addWidget(self.source_language)
+        self.language_note = QLabel(language_error)
+        self.language_note.setWordWrap(True)
+        self.language_note.setVisible(bool(language_error))
+        layout.addWidget(self.language_note)
+        self.source_language.currentIndexChanged.connect(self.change_source_language)
         self.device_mode.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
         self.ocr_mode.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
         self.api_key.textChanged.connect(lambda: self.api_key_save_timer.start())
@@ -950,6 +973,7 @@ class Controller(QWidget):
 
     def translation_is_current(self):
         return (self.worker_ready and not self.engine.stop_event.is_set()
+                and self.engine.source_language == self.source_language.currentData()
                 and self.engine.provider == self.translation_mode.currentData()
                 and self.engine.api_key == self.selected_api_key()
                 and (self.engine.provider != 'openai' or
@@ -957,6 +981,16 @@ class Controller(QWidget):
 
     def selected_openai_settings(self):
         return self.openai_base_url.text().strip(), self.openai_model.currentData() or ''
+
+    def change_source_language(self):
+        try:
+            save_source_language(self.source_language.currentData())
+            self.language_note.clear()
+            self.language_note.hide()
+        except (OSError, ValueError):
+            self.language_note.setText('원문 언어를 저장하지 못했습니다. settings.json의 상태와 권한을 확인하세요.')
+            self.language_note.show()
+        self.api_key_save_timer.start()
 
     def invalidate_model_list(self):
         self.models_generation += 1
@@ -1057,6 +1091,7 @@ class Controller(QWidget):
         self.reset_for_settings()
         self.pending_device = self.device_mode.currentData()
         self.pending_ocr_mode = self.ocr_mode.currentData()
+        self.pending_source_language = self.source_language.currentData()
         self.pending_api_key = self.selected_api_key()
         self.pending_provider = self.translation_mode.currentData()
         self.pending_base_url, self.pending_model = self.selected_openai_settings()
@@ -1068,6 +1103,7 @@ class Controller(QWidget):
         self.signals.finished.disconnect(self.frame_finished)
         self.device_mode.setEnabled(False)
         self.ocr_mode.setEnabled(False)
+        self.source_language.setEnabled(False)
         self.api_key.setEnabled(False)
         self.deepl_api_key.setEnabled(False)
         self.translation_mode.setEnabled(False)
@@ -1086,13 +1122,14 @@ class Controller(QWidget):
         self.engine = Engine(self.signals, device=self.pending_device, ocr_mode=self.pending_ocr_mode,
                              api_key=self.pending_api_key, provider=self.pending_provider,
                              base_url=self.pending_base_url, model=self.pending_model,
-                             io_logger=self.io_logger)
+                             io_logger=self.io_logger, source_language=self.pending_source_language)
         self.engine.generation = self.result_floor
         self.engine.cancel_before = self.result_floor
         self.engine.detector_size = self.detection_mode.currentData()
         self.connect_engine()
         self.device_mode.setEnabled(True)
         self.ocr_mode.setEnabled(True)
+        self.source_language.setEnabled(True)
         self.api_key.setEnabled(True)
         self.deepl_api_key.setEnabled(True)
         self.translation_mode.setEnabled(True)
@@ -1346,7 +1383,7 @@ class Controller(QWidget):
                 if self.overlay.rows:
                     self.status.setText(f'드래그 번역 완료 · {len(self.overlay.rows)}개 영역 표시 · 다시 번역으로 재실행')
                 else:
-                    self.status.setText('일본어를 인식하지 못했습니다. 영역을 좁히거나 말풍선 하나 모드를 사용해 보세요.')
+                    self.status.setText('문자를 인식하지 못했습니다. 원문 언어를 확인하고 영역을 좁히거나 말풍선 하나 모드를 사용해 보세요.')
             else:
                 self.status.setText(f'{len(self.overlay.rows)}개 영역 표시 · 화면 변화 대기 중')
 
