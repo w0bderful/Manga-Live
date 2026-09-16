@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 import re
 import time
+import socket
+import ssl
 from urllib.parse import quote
+import urllib.error
 import urllib.request
 
 from app_version import VERSION
@@ -13,7 +16,11 @@ from app_settings import read_settings, update_settings
 
 INTERVAL = 7 * 24 * 60 * 60
 REPOSITORY = 'https://github.com/w0bderful/Manga-Live'
-LATEST_API = 'https://api.github.com/repos/w0bderful/Manga-Live/releases/latest'
+RELEASES_API = 'https://api.github.com/repos/w0bderful/Manga-Live/releases?per_page=100'
+
+
+class NoReleaseError(ValueError):
+    pass
 
 
 def version_key(value):
@@ -49,7 +56,7 @@ def parse_release(release, current=VERSION):
     tag = release.get('tag_name','')
     if not isinstance(tag,str):
         raise ValueError('릴리스 버전 형식이 올바르지 않습니다.')
-    if release.get('draft') or release.get('prerelease') or tag.startswith('runtime-'):
+    if release.get('draft') or tag.startswith('runtime-'):
         return None
     if version_key(tag) <= version_key(current):
         return None
@@ -73,14 +80,64 @@ def parse_release(release, current=VERSION):
 
 def fetch_latest(current=VERSION, opener=None):
     opener = opener or urllib.request.urlopen
-    request = urllib.request.Request(LATEST_API,headers={
-        'Accept':'application/vnd.github+json','User-Agent':'MangaLive-Update/1.0',
-        'X-GitHub-Api-Version':'2022-11-28'})
-    with opener(request,timeout=10) as response:
-        data = response.read(2*1024**2+1)
-    if len(data) > 2*1024**2:
-        raise ValueError('릴리스 응답이 너무 큽니다.')
-    return parse_release(json.loads(data),current)
+    def fetch(url):
+        request = urllib.request.Request(url,headers={
+            'Accept':'application/vnd.github+json','User-Agent':'MangaLive-Update/1.0',
+            'X-GitHub-Api-Version':'2022-11-28'})
+        with opener(request,timeout=10) as response:
+            data = response.read(2*1024**2+1)
+        if len(data) > 2*1024**2:
+            raise ValueError('릴리스 응답이 너무 큽니다.')
+        return json.loads(data)
+    # /latest excludes prereleases and returns 404 when every app release is
+    # marked prerelease. The project publishes numeric app versions in both forms.
+    releases = fetch(RELEASES_API)
+    if not isinstance(releases, list):
+        raise ValueError('릴리스 목록 응답이 올바르지 않습니다.')
+    candidates = []
+    for item in releases:
+        if not isinstance(item, dict) or item.get('draft'):
+            continue
+        try:
+            key = version_key(item.get('tag_name'))
+        except ValueError:
+            continue
+        candidates.append((key, item))
+    if not candidates:
+        raise NoReleaseError('조회할 수 있는 프로그램 릴리스가 없습니다.')
+    release = max(candidates, key=lambda candidate: candidate[0])[1]
+    return parse_release(release,current)
+
+
+
+def error_detail(error):
+    """Describe network/verification failures without echoing URLs or secrets."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, urllib.error.HTTPError):
+            if error.code in (403, 429):
+                return f'GitHub 요청이 제한되거나 차단되었습니다(HTTP {error.code}). 잠시 후 다시 시도하세요.'
+            if error.code == 404:
+                return 'GitHub에서 릴리스 또는 다운로드 파일을 찾지 못했습니다(HTTP 404).'
+            return f'GitHub 서버가 오류를 반환했습니다(HTTP {error.code}).'
+        if isinstance(error, (TimeoutError, socket.timeout)):
+            return 'GitHub 응답 시간이 초과되었습니다. 잠시 후 다시 시도하세요.'
+        if isinstance(error, ssl.SSLError):
+            return '보안 연결을 확인하지 못했습니다. PC 시간과 HTTPS 검사 설정을 확인하세요.'
+        if isinstance(error, urllib.error.URLError):
+            if isinstance(error.reason, BaseException):
+                error = error.reason
+                continue
+            return 'GitHub에 연결하지 못했습니다. 인터넷 연결을 확인하세요.'
+        if isinstance(error, PermissionError):
+            return '업데이트 폴더에 쓸 수 없습니다. 폴더 권한과 파일 잠금을 확인하세요.'
+        if isinstance(error, NoReleaseError):
+            return '공개된 프로그램 릴리스가 없습니다. 릴리스 게시 상태를 확인하세요.'
+        if isinstance(error, ValueError):
+            return '릴리스 응답이나 다운로드 파일의 검증 정보가 올바르지 않습니다.'
+        error = error.__cause__ or error.__context__
+    return '인터넷 연결·GitHub 상태·저장 공간을 확인하고 다시 시도하세요.'
 
 
 def launcher_path(home):

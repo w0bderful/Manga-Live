@@ -77,8 +77,9 @@ class VersionUpdater(QObject):
             try:
                 result = updates.fetch_latest()
             except Exception as exc:
-                log.warning('Release check failed (%s)',type(exc).__name__)
-                error = '버전을 확인하지 못했습니다. 인터넷 연결이나 GitHub 상태를 확인하세요.'
+                detail = updates.error_detail(exc)
+                log.warning('Release check failed (%s): %s',type(exc).__name__,detail)
+                error = '버전을 확인하지 못했습니다. '+detail
             if not self.closed.is_set():
                 self.checked.emit(result,error,manual)
         threading.Thread(target=worker,daemon=True).start()
@@ -140,8 +141,9 @@ class VersionUpdater(QObject):
             try:
                 updates.apply_update(result,self.home,target,self.closed,show_progress)
             except Exception as exc:
-                log.warning('Launcher update failed (%s)',type(exc).__name__)
-                error = '업데이트하지 못했습니다. 인터넷 연결·폴더 권한·실행 파일 잠금을 확인하세요. 기존 실행 파일은 유지됩니다.'
+                detail = updates.error_detail(exc)
+                log.warning('Launcher update failed (%s): %s',type(exc).__name__,detail)
+                error = '업데이트하지 못했습니다. '+detail+' 기존 실행 파일은 유지됩니다.'
             if not self.closed.is_set():
                 self.downloaded.emit(result,error)
         threading.Thread(target=worker,daemon=True).start()
