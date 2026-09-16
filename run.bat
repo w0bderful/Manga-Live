@@ -17,7 +17,7 @@ if not exist ".venv\Scripts\python.exe" (
 set "failure_message=가상환경을 활성화하지 못했습니다. setup.bat을 다시 실행하세요."
 call ".venv\Scripts\activate.bat"
 if errorlevel 1 goto failed
-set "failure_message=프로그램 실행 중 오류가 발생했습니다. 위의 오류 내용과 manga-live.log를 확인하세요."
+set "failure_message=프로그램 실행 중 오류가 발생했습니다. 위의 오류 내용과 logs\manga-live-YYYY-MM-DD.log를 확인하세요."
 python main.py
 if errorlevel 1 goto failed
 exit /b 0

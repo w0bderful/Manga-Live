@@ -9,6 +9,17 @@ from mss.exception import ScreenShotError
 import numpy as np
 
 
+class CaptureProtectionError(RuntimeError):
+    pass
+
+
+def check_blank_capture(pixels):
+    if pixels.size and int(pixels.max()) <= 8 and int(pixels.max()) - int(pixels.min()) <= 2:
+        raise CaptureProtectionError(
+            '캡처 결과가 검은 화면입니다. 브라우저 화면 보호로 차단되었을 가능성이 있습니다. '
+            '선택 영역이 실제로 검은 화면인지도 확인하세요.')
+
+
 def intersection(a, b):
     x, y = max(a[0], b[0]), max(a[1], b[1])
     right, bottom = min(a[2], b[2]), min(a[3], b[3])
@@ -33,6 +44,7 @@ class NativeWindows:
         u.IsWindowVisible.argtypes = u.IsIconic.argtypes = [w.HWND]
         u.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
         u.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+        u.GetWindowDisplayAffinity.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
         u.PrintWindow.argtypes = [w.HWND, w.HDC, w.UINT]
         u.GetDC.argtypes = [w.HWND]
         u.GetDC.restype = w.HDC
@@ -83,6 +95,23 @@ class NativeWindows:
             return True
         self.user.EnumWindows(visit, 0)
         return layers
+
+    def check_protection(self, bounds, layers):
+        uncovered = np.ones((bounds[3]-bounds[1], bounds[2]-bounds[0]), dtype=bool)
+        for hwnd, box, own in layers:
+            overlap = intersection(bounds, box)
+            if own or overlap is None:
+                continue
+            x1, y1, x2, y2 = overlap
+            visible = uncovered[y1-bounds[1]:y2-bounds[1], x1-bounds[0]:x2-bounds[0]]
+            if not visible.any():
+                continue
+            affinity = w.DWORD()
+            if self.user.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity)) and affinity.value & 1:
+                raise CaptureProtectionError('선택 영역에 Windows 화면 캡처 보호가 적용된 창이 있습니다.')
+            visible[:] = False
+            if not uncovered.any():
+                break
 
     def render(self, hwnd, box):
         width, height = box[2]-box[0], box[3]-box[1]
@@ -155,6 +184,7 @@ def capture_worker(connection, owner_pid):
                     x, y, width, height = (region[k] for k in ('left', 'top', 'width', 'height'))
                     bounds = (x, y, x+width, y+height)
                     layers = native.layers(bounds)
+                    native.check_protection(bounds, layers)
                     if any(own and intersection(bounds, box) == bounds for _, box, own in layers):
                         pixels = np.zeros((height, width, 3), dtype=np.uint8)
                     else:
@@ -163,7 +193,11 @@ def capture_worker(connection, owner_pid):
                         except ScreenShotError:
                             pixels = np.zeros((height, width, 3), dtype=np.uint8)
                             layers.insert(0, (0, bounds, True))
-                    connection.send((True, restore_under_windows(pixels, bounds, layers, native.render)))
+                    pixels = restore_under_windows(pixels, bounds, layers, native.render)
+                    check_blank_capture(pixels)
+                    connection.send((True, pixels))
+                except CaptureProtectionError as exc:
+                    connection.send((False, {'type': 'capture_protection', 'message': str(exc)}))
                 except Exception as exc:
                     connection.send((False, str(exc)))
     except (EOFError, BrokenPipeError):
@@ -225,6 +259,8 @@ class CaptureWithoutApp:
                     success, result = self.connection.recv()
                     self.pending = None
                     if not success:
+                        if isinstance(result, dict) and result.get('type') == 'capture_protection':
+                            raise CaptureProtectionError(result['message'])
                         raise RuntimeError(result)
                     return result
                 elif not self.process.is_alive():

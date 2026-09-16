@@ -20,19 +20,20 @@ import unicodedata
 
 from PIL import Image
 from PyQt6.QtCore import Qt, QRect, QRectF, QTimer, QObject, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap, QAction, QActionGroup
+from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen, QRegion, QImage, QBitmap, QIcon, QAction, QActionGroup
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                             QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout,
-                            QMenuBar, QDialog, QScrollArea, QGridLayout, QSpinBox)
+                            QMenuBar, QDialog, QScrollArea, QGridLayout, QSpinBox, QMessageBox)
 from core import changed, relocate, merge_row, scroll_offset, move_rows
 from translation import (create_translation_client, TRANSLATION_MODES, validate_openai_settings,
                          list_openai_models, get_deepl_usage)
 from ocr_backends import OcrBackend, MODES, validate_device
 from api_settings import (load_api_key, save_api_keys, load_openai_settings, OPENAI_DEFAULTS,
                           load_translation_provider)
-from window_capture import CaptureWithoutApp
+from window_capture import CaptureWithoutApp, CaptureProtectionError
 from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
 from overlay_settings import DEFAULT_OPACITY, load_opacity, save_opacity
+from translation_logs import TranslationLogs, DailyRuntimeLogHandler
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ class Signals(QObject):
 class Engine(threading.Thread):
 
     def __init__(self, signals, device='cpu', ocr_mode='manga_ocr', api_key='', provider='luna',
-                 base_url='', model=''):
+                 base_url='', model='', io_logger=None):
         super().__init__(daemon=True)
         self.signals = signals
         self.device = device
@@ -98,6 +99,7 @@ class Engine(threading.Thread):
         self.api_key = api_key
         self.provider = provider
         self.base_url, self.model = base_url, model
+        self.io_logger = io_logger
         self.jobs = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self.generation = 0
@@ -159,22 +161,32 @@ class Engine(threading.Thread):
         self.jobs.put_nowait(job)
 
     async def translate(self, client, text):
-        if text in self.cache:
-            self.cache.move_to_end(text)
-            return self.cache[text]
-        result = await client.translate(text, src='ja', dest='ko')
-        translated = result.text.strip()
-        if not translated:
-            raise RuntimeError('빈 번역 결과')
-        self.cache[text] = translated
-        if len(self.cache) > 512:
-            self.cache.popitem(last=False)
+        cached = text in self.cache
+        request_id = self.io_logger.input(text, self.provider, cached) if self.io_logger else None
+        try:
+            if cached:
+                self.cache.move_to_end(text)
+                translated = self.cache[text]
+            else:
+                result = await client.translate(text, src='ja', dest='ko')
+                translated = result.text.strip()
+                if not translated:
+                    raise RuntimeError('빈 번역 결과')
+                self.cache[text] = translated
+                if len(self.cache) > 512:
+                    self.cache.popitem(last=False)
+        except Exception as exc:
+            if self.io_logger:
+                self.io_logger.output(request_id, None, self.provider, cached, type(exc).__name__)
+            raise
+        if self.io_logger:
+            self.io_logger.output(request_id, translated, self.provider, cached)
         return translated
 
     def run(self):
         try:
             if self.provider != 'openai' and not self.api_key.strip():
-                self.signals.failed.emit(self, self.generation, '선택한 번역 서비스의 API 키를 입력하고 설정 적용을 누르세요.')
+                self.signals.failed.emit(self, self.generation, '선택한 번역 서비스의 API 키를 입력하세요. 입력 후 자동으로 적용됩니다.')
                 return
             with asyncio.Runner() as runner:
                 async def work():
@@ -373,6 +385,7 @@ class Selector(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.start_point = None
         self.area = QRect()
+        self.finished = False
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -380,37 +393,92 @@ class Selector(QWidget):
         painter.setPen(QPen(QColor('#55ddff'), 2))
         painter.drawRect(self.area)
         painter.setFont(QFont('Malgun Gothic', 14))
-        painter.drawText(30, 45, '번역할 영역을 드래그하세요 · Esc: 취소')
+        painter.drawText(30, 45, '번역할 영역을 드래그하세요 · Esc / 마우스 오른쪽 클릭: 취소')
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if self.finished:
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.cancel()
+        elif event.button() == Qt.MouseButton.LeftButton:
             self.start_point = event.position().toPoint()
 
     def mouseMoveEvent(self, event):
-        if self.start_point is not None:
+        if not self.finished and self.start_point is not None:
             self.area = QRect(self.start_point, event.position().toPoint()).normalized().intersected(self.rect())
             self.update()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.start_point is not None:
+        if not self.finished and event.button() == Qt.MouseButton.LeftButton and self.start_point is not None:
             self.area = QRect(self.start_point, event.position().toPoint()).normalized().intersected(self.rect())
             if self.area.width() >= 1 and self.area.height() >= 1:
                 area = QRect(self.mapToGlobal(self.area.topLeft()), self.area.size())
+                self.finished = True
                 self.close()
                 self.selected.emit(area)
             else:
-                self.close()
-                self.cancelled.emit()
+                self.cancel()
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
+    def cancel(self):
+        if not self.finished:
+            self.finished = True
+            self.start_point = None
             self.close()
             self.cancelled.emit()
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancel()
 
-class Controller(QWidget):
+
+class ModelComboBox(QComboBox):
+    requested = pyqtSignal()
+
     def __init__(self):
         super().__init__()
+        self.open_requested = False
+
+    def showPopup(self):
+        self.open_requested = True
+        self.requested.emit()
+
+    def show_loaded_models(self):
+        should_open = self.open_requested and self.isVisible() and self.hasFocus()
+        self.open_requested = False
+        if should_open and self.count():
+            super().showPopup()
+
+    def hidePopup(self):
+        self.open_requested = False
+        super().hidePopup()
+
+    def focusOutEvent(self, event):
+        self.open_requested = False
+        super().focusOutEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.showPopup()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.open_requested = False
+        elif event.key() in (Qt.Key.Key_Space, Qt.Key.Key_F4) or (
+                event.key() == Qt.Key.Key_Down and event.modifiers() & Qt.KeyboardModifier.AltModifier):
+            self.showPopup()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class Controller(QWidget):
+    def __init__(self, io_logger=None):
+        super().__init__()
+        self.io_logger = io_logger
         self.setWindowTitle('Manga Live · 일본어 → 한국어')
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
@@ -454,7 +522,7 @@ class Controller(QWidget):
                         'openai': initial_openai_api_key}
         self.engine = Engine(self.signals, device='cuda', api_key=initial_keys[initial_provider],
                              provider=initial_provider, base_url=initial_openai_settings['base_url'],
-                             model=initial_openai_settings['model'])
+                             model=initial_openai_settings['model'], io_logger=self.io_logger)
         self.main_layout = layout = QVBoxLayout(self)
         self.menu_bar = QMenuBar(self)
         self.menu_bar.setNativeMenuBar(False)
@@ -497,16 +565,13 @@ class Controller(QWidget):
         self.device_mode.addItem('GPU 모드 (NVIDIA CUDA)', 'cuda')
         self.device_mode.setCurrentIndex(self.device_mode.findData(self.engine.device))
         device_row.addWidget(self.device_mode)
-        self.device_apply = QPushButton('설정 적용')
-        self.device_apply.clicked.connect(self.change_device)
-        device_row.addWidget(self.device_apply)
         layout.addLayout(device_row)
         layout.addWidget(QLabel('OCR 방식'))
         self.ocr_mode = QComboBox()
         for key, label in MODES.items():
             self.ocr_mode.addItem(label, key)
         layout.addWidget(self.ocr_mode)
-        ocr_note = QLabel('OCR을 선택한 뒤 설정 적용을 누르세요. OpenCV 감지는 CPU에서 실행됩니다.')
+        ocr_note = QLabel('OCR 선택은 자동으로 적용됩니다. OpenCV 감지는 CPU에서 실행됩니다.')
         ocr_note.setWordWrap(True)
         layout.addWidget(ocr_note)
         layout.addWidget(QLabel('번역 API'))
@@ -520,7 +585,9 @@ class Controller(QWidget):
         self.api_key_save_timer = QTimer(self)
         self.api_key_save_timer.setSingleShot(True)
         self.api_key_save_timer.setInterval(500)
-        self.api_key_save_timer.timeout.connect(self.save_api_key)
+        self.api_key_save_timer.timeout.connect(self.change_device)
+        self.device_mode.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
+        self.ocr_mode.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
         self.api_key.textChanged.connect(lambda: self.api_key_save_timer.start())
         layout.addWidget(self.api_key)
         self.api_key.setVisible(initial_provider == 'luna')
@@ -562,25 +629,18 @@ class Controller(QWidget):
         for label, field in [('API 주소', self.openai_base_url), ('API 키', self.openai_api_key)]:
             openai_form.addRow(label, field)
             field.textChanged.connect(lambda: self.api_key_save_timer.start())
-        self.openai_model = QComboBox()
-        self.openai_model.setPlaceholderText('모델 불러오기 후 선택')
+        self.openai_model = ModelComboBox()
+        self.openai_model.setPlaceholderText('눌러서 모델 선택')
         self.openai_model.setMinimumContentsLength(12)
         self.openai_model.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         if initial_openai_settings['model']:
             self.openai_model.addItem(initial_openai_settings['model'], initial_openai_settings['model'])
             self.openai_model.setCurrentIndex(0)
-        self.openai_model.setEnabled(self.openai_model.count() > 0)
         self.openai_model.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
-        self.load_models_button = QPushButton('모델 불러오기')
-        self.load_models_button.clicked.connect(self.load_models)
-        model_row = QWidget()
-        model_layout = QHBoxLayout(model_row)
-        model_layout.setContentsMargins(0, 0, 0, 0)
-        model_layout.addWidget(self.openai_model, 1)
-        model_layout.addWidget(self.load_models_button)
-        openai_form.addRow('모델 선택', model_row)
+        self.openai_model.requested.connect(self.load_models)
+        openai_form.addRow('모델 선택', self.openai_model)
         self.models_note = QLabel('저장된 모델을 복원했습니다. 목록을 새로 불러올 수 있습니다.'
-                                 if initial_openai_settings['model'] else '주소와 키를 입력한 뒤 모델 불러오기를 누르세요.')
+                                 if initial_openai_settings['model'] else '주소와 키를 입력한 뒤 모델 선택을 누르세요.')
         self.models_note.setWordWrap(True)
         openai_form.addRow(self.models_note)
         self.models_future = None
@@ -592,7 +652,7 @@ class Controller(QWidget):
         self.openai_api_key.textChanged.connect(self.invalidate_model_list)
         layout.addWidget(self.openai_panel)
         self.openai_panel.setVisible(initial_provider == 'openai')
-        self.api_settings_note = QLabel('API 키 파일을 읽지 못했습니다. 키를 다시 입력하고 설정을 적용하세요. '
+        self.api_settings_note = QLabel('API 키 파일을 읽지 못했습니다. 키를 다시 입력하면 자동 저장·적용됩니다. '
                                        '손상된 원본은 저장 시 api-key-backups 폴더에 보관합니다.'
                                        if self.api_settings_error else '')
         self.api_settings_note.setWordWrap(True)
@@ -664,6 +724,11 @@ class Controller(QWidget):
         self.timer.setInterval(150)
         self.timer.timeout.connect(self.tick)
         self.timer.start()
+        self.log_cleanup_timer = QTimer(self)
+        self.log_cleanup_timer.setInterval(3_600_000)
+        if self.io_logger is not None:
+            self.log_cleanup_timer.timeout.connect(self.io_logger.cleanup)
+            self.log_cleanup_timer.start()
         self.hotkey_dialog_open = False
         self.hotkeys = WindowsHotkeys(self.activate_hotkey)
         try:
@@ -898,23 +963,20 @@ class Controller(QWidget):
 
     def invalidate_model_list(self):
         self.models_generation += 1
+        self.openai_model.hidePopup()
         self.openai_model.clear()
-        self.openai_model.setEnabled(False)
-        self.models_note.setText('주소 또는 키가 변경되었습니다. 모델 목록을 다시 불러오세요.')
+        self.models_note.setText('주소 또는 키가 변경되었습니다. 모델 선택을 눌러 다시 불러오세요.')
 
     def load_models(self):
         if self.models_future is not None:
             return
-        self.load_models_button.setEnabled(False)
-        self.openai_model.setEnabled(False)
         self.models_note.setText('모델 목록을 불러오는 중…')
         self.models_request_generation = self.models_generation
         try:
             self.models_future = request_model_list(self.openai_base_url.text().strip(),
                                                    self.openai_api_key.text().strip())
         except Exception:
-            self.load_models_button.setEnabled(True)
-            self.openai_model.setEnabled(self.openai_model.count() > 0)
+            self.openai_model.open_requested = False
             self.models_note.setText('모델 목록 조회를 시작하지 못했습니다. 다시 시도하세요.')
             return
         self.models_timer.start()
@@ -924,33 +986,37 @@ class Controller(QWidget):
             return
         future, self.models_future = self.models_future, None
         self.models_timer.stop()
-        self.load_models_button.setEnabled(True)
-        self.openai_model.setEnabled(self.openai_model.count() > 0)
         if self.models_request_generation != self.models_generation:
+            if self.openai_model.open_requested:
+                self.load_models()
             return
         try:
             models = future.result()
         except (ValueError, RuntimeError) as exc:
+            self.openai_model.open_requested = False
             self.models_note.setText(str(exc))
             return
         except Exception:
+            self.openai_model.open_requested = False
             self.models_note.setText('모델 목록을 불러오지 못했습니다. 주소와 서버 상태를 확인하세요.')
             return
         previous = self.openai_model.currentData()
+        open_requested = self.openai_model.open_requested
         self.openai_model.blockSignals(True)
         self.openai_model.clear()
         for model in models:
             self.openai_model.addItem(model, model)
         self.openai_model.setCurrentIndex(self.openai_model.findData(previous) if previous else -1)
         self.openai_model.blockSignals(False)
-        self.openai_model.setEnabled(bool(models))
+        self.openai_model.open_requested = open_requested
         self.api_key_save_timer.start()
         if not models:
             self.models_note.setText('서버가 제공한 모델이 없습니다. 키와 서버의 모델 설정을 확인하세요.')
         elif previous and previous not in models:
             self.models_note.setText('기존 모델이 목록에 없습니다. 사용할 모델을 다시 선택하세요.')
         else:
-            self.models_note.setText(f'모델 {len(models)}개를 불러왔습니다. 선택 후 설정 적용을 누르세요.')
+            self.models_note.setText(f'모델 {len(models)}개를 불러왔습니다. 사용할 모델을 선택하면 자동으로 적용됩니다.')
+        self.openai_model.show_loaded_models()
 
     def selected_api_key(self):
         field = {'luna': self.api_key, 'deepl': self.deepl_api_key,
@@ -983,7 +1049,7 @@ class Controller(QWidget):
                 self.status.setText(str(exc))
                 return
         elif not self.selected_api_key():
-            self.status.setText('선택한 번역 서비스의 API 키가 필요합니다. 키 입력 후 설정 적용을 누르세요.')
+            self.status.setText('선택한 번역 서비스의 API 키가 필요합니다. 키를 입력하면 자동으로 적용됩니다.')
             return
         if (self.translation_is_current() and self.engine.is_alive()
                 and self.engine.device == self.device_mode.currentData()
@@ -1003,7 +1069,6 @@ class Controller(QWidget):
         self.signals.ready.disconnect(self.ready)
         self.signals.result.disconnect(self.accept_result)
         self.signals.finished.disconnect(self.frame_finished)
-        self.device_apply.setEnabled(False)
         self.device_mode.setEnabled(False)
         self.ocr_mode.setEnabled(False)
         self.api_key.setEnabled(False)
@@ -1023,12 +1088,12 @@ class Controller(QWidget):
         self.signals = Signals()
         self.engine = Engine(self.signals, device=self.pending_device, ocr_mode=self.pending_ocr_mode,
                              api_key=self.pending_api_key, provider=self.pending_provider,
-                             base_url=self.pending_base_url, model=self.pending_model)
+                             base_url=self.pending_base_url, model=self.pending_model,
+                             io_logger=self.io_logger)
         self.engine.generation = self.result_floor
         self.engine.cancel_before = self.result_floor
         self.engine.detector_size = self.detection_mode.currentData()
         self.connect_engine()
-        self.device_apply.setEnabled(True)
         self.device_mode.setEnabled(True)
         self.ocr_mode.setEnabled(True)
         self.api_key.setEnabled(True)
@@ -1118,7 +1183,8 @@ class Controller(QWidget):
             self.status.setText(f'영역 좌표 조회 실패: {exc} — 영역을 다시 선택하세요.')
             return
         log.info('Selected region=%s', self.region)
-        self.region_indicator.show_region(area)
+        if not self.single_shot:
+            self.region_indicator.show_region(area)
         self.update_capture_mode()
         if self.single_shot:
             self.capture_snapshot()
@@ -1163,10 +1229,26 @@ class Controller(QWidget):
             self.show()
             log.exception('Snapshot capture failed')
             self.status.setText(f'캡처 실패: {exc} — 다시 번역을 눌러 재시도하세요.')
+            self.warn_capture_protection(exc)
+
+    def warn_capture_protection(self, error):
+        if not isinstance(error, CaptureProtectionError):
+            return
+        previous = getattr(self, 'capture_warning', None)
+        if previous is not None and previous.isVisible():
+            return
+        if previous is not None:
+            previous.deleteLater()
+        self.capture_warning = QMessageBox(QMessageBox.Icon.Warning, '화면 캡처 보호 확인',
+            str(error) + '\n\nESET을 사용한다면 개요 → 브라우저 화면 보호 → 일시 중지 → 적용 후 '
+            '다시 번역하세요. 번역이 끝나면 보호를 다시 켜세요.\n'
+            '다른 보안 프로그램을 사용한다면 해당 프로그램의 화면 캡처 보호 설정을 확인하세요.',
+            QMessageBox.StandardButton.Ok, self)
+        self.capture_warning.open()
 
     def submit_snapshot(self):
         if not self.translation_is_current():
-            self.status.setText('선택한 번역 서비스의 설정을 확인하고 설정 적용을 누르세요. 전환 중이면 잠시 기다려주세요.')
+            self.status.setText('선택한 번역 서비스의 설정을 확인하세요. 변경한 설정은 자동 적용됩니다. 전환 중이면 잠시 기다려주세요.')
             return
         if self.latest is not None and not self.submitted:
             self.submitted = True
@@ -1188,13 +1270,14 @@ class Controller(QWidget):
             self.status.setText('드래그 번역을 취소했습니다.' if self.single_shot else '일시정지')
             return
         if not self.translation_is_current():
-            self.status.setText('선택한 번역 서비스의 설정을 확인하고 설정 적용을 누르세요. 적용 중이면 잠시 기다려주세요.')
+            self.status.setText('선택한 번역 서비스의 설정을 확인하세요. 변경한 설정은 자동 적용됩니다. 적용 중이면 잠시 기다려주세요.')
             return
         if self.region is None:
             self.status.setText('영역 선택을 눌러 번역할 화면 영역을 지정하세요.')
             return
         self.single_shot = False
         self.update_capture_mode()
+        self.region_indicator.show_region(self.overlay.geometry())
         self.running = not self.running
         self.toggle_button.setText('일시정지' if self.running else '번역 시작')
         self.reset_frame()
@@ -1236,6 +1319,7 @@ class Controller(QWidget):
             self.reset_frame()
             log.exception('Capture failed')
             self.status.setText(f'캡처 실패: {exc}')
+            self.warn_capture_protection(exc)
 
     def submit_pending_frame(self):
         if not self.translation_is_current():
@@ -1286,6 +1370,7 @@ class Controller(QWidget):
         if hasattr(self, 'device_timer'):
             self.device_timer.stop()
         self.timer.stop()
+        self.log_cleanup_timer.stop()
         self.engine.stop_event.set()
         self.engine.generation += 1
         self.overlay.close()
@@ -1300,12 +1385,13 @@ class Controller(QWidget):
 def configure_logging():
     options = dict(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     try:
-        logging.basicConfig(filename=ROOT/'manga-live.log', encoding='utf-8', **options)
+        directory = ROOT / 'logs'
+        logging.basicConfig(handlers=[DailyRuntimeLogHandler(directory)], **options)
     except OSError:
         handler = logging.StreamHandler(sys.stderr) if sys.stderr is not None else logging.NullHandler()
         logging.basicConfig(handlers=[handler], **options)
         log.warning('Log file unavailable; continuing without file logging', exc_info=True)
-        return '로그 파일을 열 수 없어 파일 기록 없이 실행합니다. manga-live.log의 권한과 잠금 상태를 확인하세요.'
+        return '로그 파일을 열 수 없어 파일 기록 없이 실행합니다. logs 폴더의 권한과 잠금 상태를 확인하세요.'
     return ''
 
 
@@ -1313,9 +1399,18 @@ def main():
     if sys.platform != 'win32':
         raise SystemExit('이 프로그램은 Windows 전용입니다.')
     logging_warning = configure_logging()
+    io_logger = TranslationLogs(ROOT / 'logs')
+    if not io_logger.cleanup():
+        logging_warning = '\n'.join(filter(None, [logging_warning,
+            '입출력 로그를 준비하지 못했습니다. logs 폴더의 권한을 확인하세요.']))
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('MangaLive.Desktop')
+    except OSError:
+        log.warning('Windows app identity could not be set', exc_info=True)
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(ROOT / 'assets' / 'manga-live.ico')))
     app.setQuitOnLastWindowClosed(False)
-    window = Controller()
+    window = Controller(io_logger=io_logger)
     if logging_warning:
         note = QLabel(logging_warning)
         note.setWordWrap(True)

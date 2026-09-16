@@ -58,7 +58,7 @@ def validate_api_key(api_key):
 def validate_openai_settings(base_url, model, api_key=''):
     chat_endpoint(base_url)
     if not model.strip():
-        raise ValueError('모델 불러오기를 누른 뒤 사용할 모델을 선택하세요.')
+        raise ValueError('모델 선택을 눌러 목록을 불러온 뒤 사용할 모델을 선택하세요.')
     validate_api_key(api_key)
 
 

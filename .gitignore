@@ -15,5 +15,8 @@ __pycache__/
 /hotkeys.json.tmp
 /overlay-settings.json
 /overlay-settings.json.tmp
+/logs/
 
 /tests/
+
+/AGENTS.md
