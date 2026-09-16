@@ -1,7 +1,6 @@
 """Local recognition of English handwriting, one detected text line at a time."""
 from pathlib import Path
 import re
-from difflib import SequenceMatcher
 
 MODEL_ID = 'microsoft/trocr-small-handwritten'
 
@@ -37,54 +36,13 @@ def word_quality(text):
     return score - min(3.0, noise)
 
 
-def needs_handwriting(text, confidence):
-    from wordfreq import zipf_frequency
-
-    if re.search(r'[\u3040-\u30ff\u3400-\u9fff]', text) or not text.strip():
+def usable_handwriting(text):
+    if not text or re.search(r'[\u3040-\u30ff\u3400-\u9fff]', text):
         return False
-    words = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", text)
-    if not words:
-        return False
-    rare = any(len(word) >= 3 and zipf_frequency(word.lower(), 'en') < 2.5 for word in words)
-    mixed = bool(re.search(r'[A-Za-z]\d|\d[A-Za-z]', text))
-    return confidence < 0.8 or rare or mixed or bool(re.search(r'[{}<>\\|]', text))
-
-
-def choose_reading(original, candidate):
-    if not candidate or word_quality(candidate) < word_quality(original) + 0.6:
-        return original
-    def numbers(text, other):
-        result = []
-        for match in re.finditer(r'\d+(?:[.,]\d+)*', text):
-            attached = ((match.start() > 0 and text[match.start()-1].isalpha())
-                        or (match.end() < len(text) and text[match.end()].isalpha()))
-            unit = re.match(r'(?:cm|mm|km|m|kg|g|ml|l)\b', text[match.end():], re.IGNORECASE)
-            split_word = re.match(r'\s+([A-Za-z]{2,})\b', text[match.end():])
-            letter = {'0':'o', '1':'il', '2':'z', '5':'s', '8':'b', '9':'g'}.get(match.group(), '')
-            joined_letter = bool(split_word and letter and any(
-                len(word) == len(split_word[1])+1 and word[0].lower() in letter
-                and SequenceMatcher(None, split_word[1].lower(), word[1:].lower()).ratio() >= .75
-                for word in re.findall(r'[A-Za-z]+', other)))
-            # A single digit attached to a word may be a letter error (he1lo, 9rown).
-            # Measurements, counts and multi-digit values must not be rewritten.
-            if (not attached and not joined_letter) or unit or len(match.group()) > 1:
-                result.append(match.group())
-        return result
-    if numbers(original, candidate) != numbers(candidate, original):
-        return original
-    before = re.sub(r'[^a-z]', '', original.lower())
-    after = re.sub(r'[^a-z]', '', candidate.lower())
-    if not before or not after or len(after) > max(8, len(before) * 2) or len(after) < len(before) * .5:
-        return original
-    original_words = re.findall(r'[A-Za-z]+', original)
-    candidate_words = re.findall(r'[A-Za-z]+', candidate)
-    if len(original_words) == len(candidate_words) and any(
-            len(old) >= 3 and len(new) > len(old) * 1.4
-            for old, new in zip(original_words, candidate_words)):
-        return original
-    if before and SequenceMatcher(None, before, after).ratio() < .4:
-        return original
-    return candidate
+    # Keep measurements and counts; dictionary scores only cover ordinary words.
+    if re.fullmatch(r'\d+(?:[.,]\d+)?\s*(?:cm|mm|km|m|kg|g|ml|l|%)?', text, re.I):
+        return True
+    return bool(re.search(r'[A-Za-z]', text)) and word_quality(text) >= 2.5
 
 
 class HandwritingOcr:

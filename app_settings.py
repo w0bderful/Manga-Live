@@ -5,6 +5,11 @@ import threading
 SETTINGS_FILE = Path(__file__).resolve().parent / 'settings.json'
 SOURCE_LANGUAGES = {'auto': '자동 언어 감지', 'ja': '일본어', 'en': '영어'}
 DEFAULT_SOURCE_LANGUAGE = 'ja'
+UI_DEFAULTS = {
+    'monitor': '', 'interface_mode': 'basic', 'always_on_top': True,
+    'device': 'cuda', 'detection_size': None,
+    'single_balloon': False,
+}
 _lock = threading.RLock()
 
 
@@ -44,3 +49,30 @@ def load_source_language():
 
 def save_source_language(value):
     update_settings({'source_language': validate_source_language(value)})
+
+
+def validate_ui_settings(value):
+    if not isinstance(value, dict):
+        raise ValueError('화면 설정은 JSON 객체여야 합니다.')
+    result = {**UI_DEFAULTS, **value}
+    choices = {'interface_mode': ('basic', 'advanced'), 'device': ('cpu', 'cuda')}
+    for key, options in choices.items():
+        if not isinstance(result[key], str) or result[key] not in options:
+            raise ValueError(f'잘못된 화면 설정: {key}')
+    if not isinstance(result['monitor'], str):
+        raise ValueError('잘못된 모니터 설정입니다.')
+    for key in ('always_on_top', 'single_balloon'):
+        if type(result[key]) is not bool:
+            raise ValueError(f'잘못된 화면 설정: {key}')
+    size = result['detection_size']
+    if size is not None and (type(size) is not int or size not in (960, 1280, 1920)):
+        raise ValueError('잘못된 감지 해상도입니다.')
+    return {key: result[key] for key in UI_DEFAULTS}
+
+
+def load_ui_settings(path=None):
+    return validate_ui_settings(read_settings(path).get('ui', {}))
+
+
+def save_ui_settings(value, path=None):
+    update_settings({'ui': validate_ui_settings(value)}, path)

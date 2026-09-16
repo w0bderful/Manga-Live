@@ -120,7 +120,7 @@ def changed(before, after, threshold=0.008):
     return bool(different.size and float(np.mean(different)) > threshold)
 
 
-def text_boxes(horizontal, free, width, height):
+def text_boxes(horizontal, free, width, height, *, merge=True, can_merge=None):
     raw = [(b[0], b[2], b[1], b[3]) for b in horizontal]
     for poly in free:
         points = np.asarray(poly)
@@ -133,6 +133,11 @@ def text_boxes(horizontal, free, width, height):
         x2, y2 = min(width, int(x2)+4), min(height, int(y2)+4)
         if x2-x1 >= 8 and y2-y1 >= 8:
             boxes.append(Box(x1, y1, x2-x1, y2-y1, vertical))
+    if not merge:
+        return sorted(boxes, key=lambda b: (b.y, -b.x))
+    # Compare original text lines, not growing union rectangles that can engulf
+    # unrelated bubbles and then bridge into the next panel.
+    groups = [[box] for box in boxes]
     while True:
         merged = False
         for i, a in enumerate(boxes):
@@ -145,7 +150,10 @@ def text_boxes(horizontal, free, width, height):
                 col = (a.h > a.w and b.h > b.w and
                        yo > 0.55*min(a.h, b.h) and -xo < 0.65*min(a.w, b.w))
                 overlap = xo > 0 and yo > 0
-                if row or col or overlap:
+                linked = row or col or overlap
+                if can_merge is not None:
+                    linked = any(can_merge(first, second) for first in groups[i] for second in groups[j])
+                if linked:
                     x, y = min(a.x, b.x), min(a.y, b.y)
                     direction = a.vertical if a.vertical is not None else b.vertical
                     if a.vertical is not None and b.vertical is not None and a.vertical != b.vertical:
@@ -153,6 +161,7 @@ def text_boxes(horizontal, free, width, height):
                     boxes[i] = Box(x, y, max(a.x+a.w, b.x+b.w)-x,
                                    max(a.y+a.h, b.y+b.h)-y, direction)
                     boxes.pop(j)
+                    groups[i].extend(groups.pop(j))
                     merged = True
                     break
             if merged:

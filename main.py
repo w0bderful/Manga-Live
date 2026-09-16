@@ -22,23 +22,32 @@ import unicodedata
 from PIL import Image
 from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QRegion, QImage, QBitmap, QIcon, QAction, QActionGroup, QTextLayout, QTextOption, QTextCharFormat
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout,
                             QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QFormLayout,
-                            QMenuBar, QDialog, QScrollArea, QGridLayout, QMessageBox, QFontComboBox, QSpinBox)
+                            QMenuBar, QDialog, QScrollArea, QGridLayout, QMessageBox, QFontComboBox, QSpinBox, QProgressBar)
 from core import changed, relocate, merge_row, scroll_offset, move_rows
 from translation import (create_translation_client, TRANSLATION_MODES, validate_openai_settings,
                          list_openai_models, get_deepl_usage)
-from ocr_backends import OcrBackend, MODES, MODE_DESCRIPTIONS, validate_device
+from ocr_backends import OcrBackend, OcrModels, OcrReading
 from api_settings import (load_api_key, save_api_keys, load_openai_settings, OPENAI_DEFAULTS,
                           load_translation_provider)
 from window_capture import CaptureWithoutApp, CaptureProtectionError
 from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
 from overlay_settings import DEFAULT_TEXT_STYLE, load_text_style, save_text_style
+from window_theme import (SakuraBackdrop, apply_window_theme, WINDOW_THEMES, DEFAULT_WINDOW_THEME,
+                          load_window_theme, save_window_theme)
 from translation_logs import TranslationLogs, DailyRuntimeLogHandler
+from resource_usage import ResourceMonitor
 from app_settings import (SOURCE_LANGUAGES, DEFAULT_SOURCE_LANGUAGE, load_source_language,
-                          save_source_language, validate_source_language)
+                          save_source_language, validate_source_language,
+                          UI_DEFAULTS, load_ui_settings, save_ui_settings)
 
 log = logging.getLogger(__name__)
+TRANSLATION_RETRIES = 5
+
+
+class TranslationCancelled(Exception):
+    pass
 
 
 def request_model_list(base_url, api_key):
@@ -89,16 +98,16 @@ class Signals(QObject):
     ready = pyqtSignal()
     failed = pyqtSignal(object, int, str)
     finished = pyqtSignal(int)
+    progress = pyqtSignal(object, int, int, int, str)
 
 
 class Engine(threading.Thread):
 
-    def __init__(self, signals, device='cpu', ocr_mode='manga_ocr', api_key='', provider='luna',
-                 base_url='', model='', io_logger=None, source_language='ja'):
+    def __init__(self, signals, device='cpu', api_key='', provider='luna',
+                 base_url='', model='', io_logger=None, source_language='ja', ocr_models=None):
         super().__init__(daemon=True)
         self.signals = signals
         self.device = device
-        self.ocr_mode = ocr_mode
         self.source_language = validate_source_language(source_language)
         self.api_key = api_key
         self.provider = provider
@@ -106,15 +115,17 @@ class Engine(threading.Thread):
         self.io_logger = io_logger
         self.jobs = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
+        self.processing = threading.Event()
         self.generation = 0
         self.cache = OrderedDict()
         self.ocr_cache = OrderedDict()
         self.latest_job = None
         self.cancel_before = 0
         self.detector_size = None
+        self.ocr_models = ocr_models if ocr_models is not None else OcrModels(device, ROOT)
 
     async def process_boxes(self, generation, pixels, boxes, mocr, client):
-
+        self.signals.progress.emit(self, generation, 0, len(boxes), '번역')
         for i, box in enumerate(boxes):
             if self.stop_event.is_set() or generation < self.cancel_before:
                 break
@@ -132,31 +143,39 @@ class Engine(threading.Thread):
             crop = Image.fromarray(active_pixels[y1:y2, x1:x2])
             key = (crop.size, hashlib.sha256(crop.tobytes()).digest())
             if key in self.ocr_cache:
-                source = self.ocr_cache[key]
+                reading = self.ocr_cache[key]
                 self.ocr_cache.move_to_end(key)
             else:
                 ocr_started = time.monotonic()
-                source = mocr(crop).strip()
-                log.info('OCR completed: seconds=%.2f chars=%s', time.monotonic()-ocr_started, len(source))
-                self.ocr_cache[key] = source
+                reading = mocr(crop)
+                if isinstance(reading, str):
+                    reading = OcrReading(reading.strip(), self.source_language)
+                log.info('OCR completed: seconds=%.2f chars=%s language=%s', time.monotonic()-ocr_started, len(reading.text), reading.language)
+                self.ocr_cache[key] = reading
                 if len(self.ocr_cache) > 256:
                     self.ocr_cache.popitem(last=False)
             if self.stop_event.is_set() or generation < self.cancel_before:
                 break
-            pattern = r'[\u3040-\u30ff\u3400-\u9fff]' if self.source_language == 'ja' else r'[A-Za-z\u3040-\u30ff\u3400-\u9fff]'
+            source, source_language = reading.text, reading.language
+            pattern = r'[\u3040-\u30ff\u3400-\u9fff]' if source_language == 'ja' else r'[A-Za-z\u3040-\u30ff\u3400-\u9fff]'
             if not re.search(pattern, source):
+                self.signals.progress.emit(self, generation, i+1, len(boxes), '번역')
                 continue
-            if self.source_language == 'en' or (self.source_language == 'auto'
+            if source_language == 'en' or (source_language == 'auto'
                     and re.search(r'[A-Za-z]', source)
                     and not re.search(r'[\u3040-\u30ff\u3400-\u9fff]', source)):
                 active_box = replace(active_box, vertical=False)
             self.signals.status.emit(f'{TRANSLATION_MODES[self.provider]} 응답 대기 중… {i+1}/{len(boxes)}')
-            translated = await self.translate(client, source)
+            try:
+                translated = await self.translate(client, source, source_language, generation=generation)
+            except TranslationCancelled:
+                return
             if self.stop_event.is_set() or generation < self.cancel_before:
                 break
 
 
             self.signals.result.emit(active_generation, [(active_box, translated)], active_pixels)
+            self.signals.progress.emit(self, generation, i+1, len(boxes), '번역')
 
     def valid(self, generation):
         return not self.stop_event.is_set() and generation == self.generation
@@ -169,19 +188,43 @@ class Engine(threading.Thread):
             pass
         self.jobs.put_nowait(job)
 
-    async def translate(self, client, text):
-        cached = text in self.cache
-        request_id = self.io_logger.input(text, self.provider, cached) if self.io_logger else None
-        try:
-            if cached:
-                self.cache.move_to_end(text)
-                translated = self.cache[text]
-            else:
-                result = await client.translate(text, src=self.source_language, dest='ko')
+    async def request_translation(self, client, text, source_language, generation):
+        def check_cancelled():
+            if self.stop_event.is_set() or (generation is not None and generation < self.cancel_before):
+                raise TranslationCancelled()
+
+        for attempt in range(TRANSLATION_RETRIES+1):
+            check_cancelled()
+            try:
+                result = await client.translate(text, src=source_language, dest='ko')
                 translated = result.text.strip()
                 if not translated:
                     raise RuntimeError('빈 번역 결과')
-                self.cache[text] = translated
+                return translated
+            except Exception as exc:
+                check_cancelled()
+                if attempt == TRANSLATION_RETRIES:
+                    raise
+                log.warning('Translation retry: provider=%s retry=%s/%s error_type=%s',
+                            self.provider, attempt+1, TRANSLATION_RETRIES, type(exc).__name__)
+                self.signals.status.emit(f'번역 API 요청 실패 · 재시도 {attempt+1}/{TRANSLATION_RETRIES}')
+                # Wait one second, but let cancel/stop interrupt the retry promptly.
+                for _ in range(10):
+                    check_cancelled()
+                    await asyncio.sleep(.1)
+
+    async def translate(self, client, text, source_language=None, *, generation=None):
+        source_language = source_language or self.source_language
+        key = text if source_language == self.source_language else (source_language, text)
+        cached = key in self.cache
+        request_id = self.io_logger.input(text, self.provider, cached) if self.io_logger else None
+        try:
+            if cached:
+                self.cache.move_to_end(key)
+                translated = self.cache[key]
+            else:
+                translated = await self.request_translation(client, text, source_language, generation)
+                self.cache[key] = translated
                 if len(self.cache) > 512:
                     self.cache.popitem(last=False)
         except Exception as exc:
@@ -194,12 +237,18 @@ class Engine(threading.Thread):
 
     def run(self):
         try:
+            if not self.ocr_models.preload(self.signals.status.emit, self.stop_event.is_set,
+                    lambda done, total, label: self.signals.progress.emit(self, -1, done, total, label)):
+                return
             if self.provider != 'openai' and not self.api_key.strip():
                 self.signals.failed.emit(self, self.generation, '선택한 번역 서비스의 API 키를 입력하세요. 입력 후 자동으로 적용됩니다.')
                 return
             with asyncio.Runner() as runner:
                 async def work():
-                    backend = None
+                    import torch
+                    backend = OcrBackend(self.device, ROOT, self.source_language,
+                                         models=self.ocr_models)
+                    backend.status = self.signals.status.emit
                     async with create_translation_client(self.provider, self.api_key,
                                                          base_url=self.base_url, model=self.model) as client:
                         self.signals.ready.emit()
@@ -212,22 +261,19 @@ class Engine(threading.Thread):
                                 continue
                             started = time.monotonic()
                             try:
-                                if backend is None:
-                                    import torch
-                                    validate_device(self.device)
-                                    self.signals.status.emit(f'{MODES[self.ocr_mode]} 첫 로딩 중…')
-                                    backend = OcrBackend(self.ocr_mode, self.device, ROOT, self.source_language)
-                                    backend.status = self.signals.status.emit
                                 if not self.valid(generation):
                                     continue
+                                self.processing.set()
                                 self.signals.status.emit('글자 영역 감지 중…')
+                                self.signals.progress.emit(self, generation, 0, 0, '글자 영역 감지 중…')
                                 with torch.inference_mode():
                                     detect_started = time.monotonic()
                                     boxes = backend.detect(pixels, self.detector_size, manual)
-                                    log.info('Detection: %.3fs mode=%s canvas=%s boxes=%s',
-                                             time.monotonic()-detect_started, self.ocr_mode, self.detector_size, len(boxes))
-                                    await self.process_boxes(generation, pixels, boxes, backend.recognize, client)
+                                    log.info('Detection: %.3fs canvas=%s boxes=%s',
+                                             time.monotonic()-detect_started, self.detector_size, len(boxes))
+                                    await self.process_boxes(generation, pixels, boxes, backend.read, client)
                                 if self.valid(generation):
+                                    self.signals.progress.emit(self, generation, 1, 1, '번역 완료' if boxes else '감지 완료 · 글자 없음')
                                     self.signals.finished.emit(generation)
                                     if not boxes:
                                         self.signals.status.emit('글자 영역을 찾지 못했습니다. 말풍선 하나 모드를 사용해 보세요.')
@@ -237,10 +283,13 @@ class Engine(threading.Thread):
                                 log.exception('Frame processing failed')
                                 if self.valid(generation):
                                     self.signals.failed.emit(self, generation, f'처리 실패: {exc} — 다시 번역을 눌러 재시도하세요.')
+                            finally:
+                                self.processing.clear()
                 runner.run(work())
         except Exception as exc:
             log.exception('Engine initialization failed')
-            self.signals.failed.emit(self, self.generation, f'모델 초기화 실패: {exc}\n의존성과 인터넷 연결을 확인한 뒤 재실행하세요.')
+            if not self.stop_event.is_set():
+                self.signals.failed.emit(self, self.generation, f'초기화 실패: {exc}\nOCR 장치 설정·의존성과 인터넷 연결을 확인한 뒤 다시 시도하세요.')
 
 
 def vertical_text_layout(text, rect, family='Malgun Gothic', max_size=23, bold=False):
@@ -546,13 +595,27 @@ class ModelComboBox(QComboBox):
 class Controller(QWidget):
     def __init__(self, io_logger=None):
         super().__init__()
+        self.restoring_settings = True
+        ui_error = ''
+        try:
+            initial_ui = load_ui_settings()
+        except (OSError, ValueError):
+            initial_ui = dict(UI_DEFAULTS)
+            ui_error = '화면 설정을 읽지 못해 기본값을 사용합니다. settings.json을 확인하세요.'
         self.io_logger = io_logger
         self.setWindowTitle('Manga Live · 화면 → 한국어')
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, initial_ui['always_on_top'])
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAutoFillBackground(True)
         self.resize(510, 230)
+        self.sakura_background = SakuraBackdrop(self)
+        theme_error = ''
+        try:
+            initial_theme = load_window_theme()
+        except (OSError,ValueError):
+            initial_theme = DEFAULT_WINDOW_THEME
+            theme_error = '창 배경 설정을 읽지 못해 기본값을 사용합니다. settings.json을 확인하세요.'
         self.overlay = Overlay()
         style_error = ''
         try:
@@ -593,7 +656,8 @@ class Controller(QWidget):
         except (OSError, ValueError):
             initial_language = DEFAULT_SOURCE_LANGUAGE
             language_error = '원문 언어 설정을 읽지 못해 일본어를 사용합니다. settings.json을 확인하세요.'
-        self.engine = Engine(self.signals, device='cuda', api_key=initial_keys[initial_provider],
+        self.engine = Engine(self.signals, device=initial_ui['device'],
+                             api_key=initial_keys[initial_provider],
                              provider=initial_provider, base_url=initial_openai_settings['base_url'],
                              model=initial_openai_settings['model'], io_logger=self.io_logger,
                              source_language=initial_language)
@@ -613,70 +677,98 @@ class Controller(QWidget):
             self.interface_modes.addAction(action)
             self.menu_bar.addAction(action)
             action.triggered.connect(lambda checked, selected=mode: self.set_interface_mode(selected))
+        self.selected_window_theme = initial_theme
+        self.theme_menu = self.menu_bar.addMenu('창 배경')
+        self.theme_actions = QActionGroup(self)
+        self.theme_actions.setExclusive(True)
+        self.window_theme_actions = {}
+        for key, label in WINDOW_THEMES.items():
+            action = self.theme_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(key)
+            action.setChecked(key == initial_theme)
+            self.theme_actions.addAction(action)
+            self.window_theme_actions[key] = action
+        self.theme_actions.triggered.connect(lambda action: self.change_window_theme(action.data()))
         self.always_on_top = QCheckBox('최상단 고정')
         self.always_on_top.setToolTip('프로그램 창을 다른 앱보다 위에 표시합니다.')
-        self.always_on_top.setChecked(True)
+        self.always_on_top.setChecked(initial_ui['always_on_top'])
         self.always_on_top.toggled.connect(self.set_always_on_top)
         self.menu_bar.setCornerWidget(self.always_on_top, Qt.Corner.TopRightCorner)
         self.inline_settings = QScrollArea()
         self.inline_settings.setWidgetResizable(True)
+        self.inline_settings.viewport().setAutoFillBackground(False)
         layout.addWidget(self.inline_settings, 1)
         self.settings_panel = QWidget()
         layout = QVBoxLayout(self.settings_panel)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(QLabel('모니터'))
+        self.settings_grid = QGridLayout()
+        self.settings_grid.setHorizontalSpacing(12)
+        self.settings_grid.setVerticalSpacing(10)
+        self.settings_grid.setColumnStretch(0,1)
+        self.settings_grid.setColumnStretch(1,1)
+        layout.addLayout(self.settings_grid)
+
+        def add_setting(label, control, row, column, span=1):
+            cell = QWidget()
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(0,0,0,0)
+            cell_layout.setSpacing(4)
+            cell_layout.addWidget(QLabel(label))
+            cell_layout.addWidget(control)
+            control.setMinimumContentsLength(10)
+            control.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            for index in range(control.count()):
+                if not control.itemData(index,Qt.ItemDataRole.ToolTipRole):
+                    control.setItemData(index,control.itemText(index),Qt.ItemDataRole.ToolTipRole)
+            self.settings_grid.addWidget(cell,row,column,1,span)
+
         self.screens = QComboBox()
         for screen in QApplication.screens():
             self.screens.addItem(screen.name(), screen)
-        layout.addWidget(self.screens)
-        layout.addWidget(QLabel('OCR 처리 장치'))
-        device_row = QHBoxLayout()
+        monitor_index = self.screens.findText(initial_ui['monitor'])
+        if monitor_index >= 0:
+            self.screens.setCurrentIndex(monitor_index)
+        add_setting('모니터',self.screens,0,0)
+        self.theme_note = QLabel(theme_error)
+        self.theme_note.setWordWrap(True)
+        self.theme_note.setVisible(bool(theme_error))
         self.device_mode = QComboBox()
         self.device_mode.addItem('CPU 모드', 'cpu')
         self.device_mode.addItem('GPU 모드 (NVIDIA CUDA)', 'cuda')
         self.device_mode.setCurrentIndex(self.device_mode.findData(self.engine.device))
-        device_row.addWidget(self.device_mode)
-        layout.addLayout(device_row)
-        layout.addWidget(QLabel('OCR 방식'))
-        self.ocr_mode = QComboBox()
-        for key, label in MODES.items():
-            self.ocr_mode.addItem(label, key)
-            self.ocr_mode.setItemData(self.ocr_mode.count()-1, MODE_DESCRIPTIONS[key], Qt.ItemDataRole.ToolTipRole)
-        layout.addWidget(self.ocr_mode)
-        ocr_note = QLabel('OCR 선택은 자동으로 적용됩니다. OpenCV 감지는 CPU에서 실행됩니다.')
+        add_setting('OCR 처리 장치',self.device_mode,0,1)
+        ocr_note = QLabel('OpenCV 영역 감지·이미지 보정은 CPU에서 실행됩니다.')
         ocr_note.setWordWrap(True)
         layout.addWidget(ocr_note)
-        layout.addWidget(QLabel('번역 API'))
         self.translation_mode = QComboBox()
         for key, label in TRANSLATION_MODES.items():
             self.translation_mode.addItem(label, key)
         self.translation_mode.setCurrentIndex(self.translation_mode.findData(initial_provider))
-        layout.addWidget(self.translation_mode)
+        add_setting('번역 API',self.translation_mode,1,0)
         self.api_key = QLineEdit(initial_api_key)
-        self.api_key.setPlaceholderText('Kie API 키 (api-keys.json · kie_api_key에 평문 저장)')
+        self.api_key.setPlaceholderText('API 키 입력')
         self.api_key_save_timer = QTimer(self)
         self.api_key_save_timer.setSingleShot(True)
         self.api_key_save_timer.setInterval(500)
         self.api_key_save_timer.timeout.connect(self.change_device)
-        layout.addWidget(QLabel('원문 언어'))
         self.source_language = QComboBox()
-        self.source_language.setToolTip('자동 감지는 일본어·영어 원문을 인식합니다. 자동 감지·영어는 EasyOCR로 읽고 불확실한 영어는 TrOCR로 보완합니다.')
+        self.source_language.setToolTip('영역 감지·이미지 보정은 OpenCV, 자동 언어 판별은 EasyOCR를 사용합니다. 일본어는 Manga OCR, 영어는 TrOCR로 읽고 실패하거나 불확실하면 EasyOCR를 사용합니다.')
         for code, label in SOURCE_LANGUAGES.items():
             self.source_language.addItem(label, code)
         self.source_language.setCurrentIndex(self.source_language.findData(initial_language))
-        layout.addWidget(self.source_language)
+        add_setting('원문 언어',self.source_language,1,1)
         self.language_note = QLabel(language_error)
         self.language_note.setWordWrap(True)
         self.language_note.setVisible(bool(language_error))
         layout.addWidget(self.language_note)
         self.source_language.currentIndexChanged.connect(self.change_source_language)
         self.device_mode.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
-        self.ocr_mode.currentIndexChanged.connect(lambda: self.api_key_save_timer.start())
         self.api_key.textChanged.connect(lambda: self.api_key_save_timer.start())
         layout.addWidget(self.api_key)
         self.api_key.setVisible(initial_provider == 'luna')
         self.deepl_api_key = QLineEdit(initial_deepl_api_key)
-        self.deepl_api_key.setPlaceholderText('DeepL API 키 (Free / Pro 자동 선택 · 평문 저장)')
+        self.deepl_api_key.setPlaceholderText('API 키 입력')
         self.deepl_api_key.textChanged.connect(lambda: self.api_key_save_timer.start())
         layout.addWidget(self.deepl_api_key)
         self.deepl_api_key.setVisible(initial_provider == 'deepl')
@@ -709,7 +801,7 @@ class Controller(QWidget):
         self.openai_base_url = QLineEdit(initial_openai_settings['base_url'])
         self.openai_base_url.setPlaceholderText('https://서버주소/v1 또는 전체 /chat/completions 주소')
         self.openai_api_key = QLineEdit(initial_openai_api_key)
-        self.openai_api_key.setPlaceholderText('인증이 없는 로컬 서버는 비워도 됩니다')
+        self.openai_api_key.setPlaceholderText('API 키 입력')
         for label, field in [('API 주소', self.openai_base_url), ('API 키', self.openai_api_key)]:
             openai_form.addRow(label, field)
             field.textChanged.connect(lambda: self.api_key_save_timer.start())
@@ -769,16 +861,18 @@ class Controller(QWidget):
         self.hotkey_button.clicked.connect(self.configure_hotkeys)
         layout.addWidget(self.hotkey_button)
         self.manual = QCheckBox('선택 영역 전체가 말풍선 하나 (자동 감지 생략)')
+        self.manual.setChecked(initial_ui['single_balloon'])
         self.manual.toggled.connect(self.reset_frame)
         layout.addWidget(self.manual)
-        layout.addWidget(QLabel('감지 해상도'))
         self.detection_mode = QComboBox()
         self.detection_mode.addItem('원본 해상도 (기본 · 축소 없이 감지)', None)
         self.detection_mode.addItem('빠른 감지 (작은 글자는 놓칠 수 있음)', 960)
         self.detection_mode.addItem('균형 감지', 1280)
         self.detection_mode.addItem('정밀 감지 (작은 글씨 · 느림)', 1920)
+        self.detection_mode.setCurrentIndex(self.detection_mode.findData(initial_ui['detection_size']))
+        self.engine.detector_size = initial_ui['detection_size']
         self.detection_mode.currentIndexChanged.connect(self.change_detection_mode)
-        layout.addWidget(self.detection_mode)
+        add_setting('감지 해상도',self.detection_mode,2,0,2)
         self.text_style_panel = QWidget()
         style_form = QFormLayout(self.text_style_panel)
         style_form.setContentsMargins(0,0,0,0)
@@ -808,6 +902,12 @@ class Controller(QWidget):
         self.status = QLabel('준비 중…')
         self.status.setWordWrap(True)
         self.main_layout.addWidget(self.status)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 4)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat('OCR 로딩 대기')
+        self.progress_bar.setMinimumHeight(22)
+        self.main_layout.addWidget(self.progress_bar)
         self.capture_note = QLabel('')
         self.capture_note.setWordWrap(True)
         self.main_layout.addWidget(self.capture_note)
@@ -837,20 +937,76 @@ class Controller(QWidget):
         self.hotkey_note.setWordWrap(True)
         layout.addWidget(self.hotkey_note)
         self.update_hotkey_note(hotkey_errors)
+        self.main_layout.addWidget(self.theme_note)
+        self.ui_settings_note = QLabel(ui_error)
+        self.ui_settings_note.setWordWrap(True)
+        self.ui_settings_note.setVisible(bool(ui_error))
+        self.main_layout.addWidget(self.ui_settings_note)
+        self.resource_note = QLabel('CPU —  ·  GPU —  ·  VRAM —')
+        self.resource_note.setWordWrap(True)
+        self.resource_note.setToolTip('현재 프로그램의 사용량입니다. CPU는 전체 논리 코어 기준, GPU는 가장 바쁜 엔진 기준, VRAM은 전용 GPU 메모리입니다. 조회 불가는 드라이버가 정보를 제공하지 않는 경우입니다.')
+        self.main_layout.addWidget(self.resource_note)
+        self.resource_monitor = ResourceMonitor()
+        self.resource_monitor.start()
         layout.addStretch()
         self.settings_dialog = QDialog(self)
+        self.settings_background = SakuraBackdrop(self.settings_dialog)
         self.settings_dialog.setWindowTitle('Manga Live 설정')
         self.settings_dialog.finished.connect(self.restore_inline_settings)
         dialog_layout = QVBoxLayout(self.settings_dialog)
         self.dialog_settings = QScrollArea()
         self.dialog_settings.setWidgetResizable(True)
+        self.dialog_settings.viewport().setAutoFillBackground(False)
         dialog_layout.addWidget(self.dialog_settings)
         close_settings = QPushButton('닫기')
         close_settings.clicked.connect(self.settings_dialog.close)
         dialog_layout.addWidget(close_settings)
         self.interface_mode = None
-        self.set_interface_mode('basic')
+        self.apply_selected_window_theme()
+        self.set_interface_mode(initial_ui['interface_mode'])
+        self.restoring_settings = False
+        for control in (self.screens, self.device_mode, self.detection_mode):
+            control.currentIndexChanged.connect(self.save_current_ui_settings)
+        for control in (self.manual, self.always_on_top):
+            control.toggled.connect(self.save_current_ui_settings)
         self.engine.start()
+
+    def save_current_ui_settings(self, *_):
+        if self.restoring_settings:
+            return
+        settings = {
+            'monitor': self.screens.currentText(), 'interface_mode': self.interface_mode,
+            'always_on_top': self.always_on_top.isChecked(), 'device': self.device_mode.currentData(),
+            'detection_size': self.detection_mode.currentData(),
+            'single_balloon': self.manual.isChecked(),
+        }
+        try:
+            save_ui_settings(settings)
+        except (OSError, ValueError):
+            self.ui_settings_note.setText('화면 설정을 저장하지 못했습니다. settings.json의 상태와 권한을 확인하세요.')
+            self.ui_settings_note.show()
+        else:
+            self.ui_settings_note.clear()
+            self.ui_settings_note.hide()
+
+    def apply_selected_window_theme(self):
+        theme = self.selected_window_theme
+        # Child dialog styles must be cleared before changing the parent style.
+        self.settings_dialog.setStyleSheet('')
+        apply_window_theme(self,self.sakura_background,theme)
+        apply_window_theme(self.settings_dialog,self.settings_background,theme)
+
+    def change_window_theme(self, theme):
+        self.selected_window_theme = theme
+        self.apply_selected_window_theme()
+        try:
+            save_window_theme(theme)
+        except (OSError,ValueError):
+            self.theme_note.setText('창 배경을 저장하지 못했습니다. settings.json의 상태와 권한을 확인하세요.')
+            self.theme_note.show()
+        else:
+            self.theme_note.clear()
+            self.theme_note.hide()
 
     def set_interface_mode(self, mode):
         if mode == self.interface_mode:
@@ -872,6 +1028,7 @@ class Controller(QWidget):
         self.deepl_usage_panel.setVisible(self.translation_mode.currentData() == 'deepl')
         target = self.inline_settings if advanced else self.dialog_settings
         target.setWidget(self.settings_panel)
+        self.settings_panel.setAutoFillBackground(False)
         self.settings_panel.show()
         self.inline_settings.setVisible(advanced)
         self.capture_note.setVisible(advanced)
@@ -881,7 +1038,8 @@ class Controller(QWidget):
         self.advanced_mode_action.setChecked(advanced)
         self.main_layout.activate()
         available = self.screen().availableGeometry()
-        self.resize(560 if advanced else 510, min(850, available.height() - 80) if advanced else self.minimumSizeHint().height())
+        self.resize(560 if advanced else 510, min(760, available.height() - 80) if advanced else self.minimumSizeHint().height())
+        self.save_current_ui_settings()
 
     def change_text_style(self, *_):
         style = {'font_family': self.translation_font.currentFont().family(),
@@ -903,6 +1061,7 @@ class Controller(QWidget):
         if self.inline_settings.widget() is self.settings_panel:
             self.inline_settings.takeWidget()
             self.dialog_settings.setWidget(self.settings_panel)
+            self.settings_panel.setAutoFillBackground(False)
             self.inline_settings.hide()
             self.settings_panel.show()
             self.main_layout.activate()
@@ -917,9 +1076,10 @@ class Controller(QWidget):
         if self.interface_mode == 'advanced' and self.dialog_settings.widget() is self.settings_panel:
             self.dialog_settings.takeWidget()
             self.inline_settings.setWidget(self.settings_panel)
+            self.settings_panel.setAutoFillBackground(False)
             self.inline_settings.show()
             self.settings_panel.show()
-            self.resize(560, min(850, self.screen().availableGeometry().height() - 80))
+            self.resize(560, min(760, self.screen().availableGeometry().height() - 80))
 
     def update_hotkey_note(self, errors=()):
         buttons = {'select': self.select_button, 'drag': self.drag_button,
@@ -961,11 +1121,26 @@ class Controller(QWidget):
             self.hotkey_dialog_open = False
 
     def connect_engine(self):
+        self.signals.progress.connect(self.update_progress)
         self.signals.status.connect(self.status.setText)
         self.signals.failed.connect(self.processing_failed)
         self.signals.ready.connect(self.ready)
         self.signals.result.connect(self.accept_result)
         self.signals.finished.connect(self.frame_finished)
+
+    def update_progress(self, engine, generation, done, total, label):
+        if engine is not self.engine or engine.stop_event.is_set():
+            return
+        if generation != -1 and (not self.running or generation != engine.generation):
+            return
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done)
+        self.progress_bar.setFormat(f'{label} · %v/%m (%p%)' if total > 1 else label)
+
+    def stop_progress(self, label):
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(label)
 
     def set_always_on_top(self, enabled):
         visible = self.isVisible()
@@ -1051,7 +1226,6 @@ class Controller(QWidget):
     def translation_is_current(self):
         return (self.worker_ready and not self.engine.stop_event.is_set()
                 and self.engine.device == self.device_mode.currentData()
-                and self.engine.ocr_mode == self.ocr_mode.currentData()
                 and self.engine.source_language == self.source_language.currentData()
                 and self.engine.provider == self.translation_mode.currentData()
                 and self.engine.api_key == self.selected_api_key()
@@ -1161,15 +1335,12 @@ class Controller(QWidget):
         elif not self.selected_api_key():
             self.status.setText('선택한 번역 서비스의 API 키가 필요합니다. 키를 입력하면 자동으로 적용됩니다.')
             return
-        if (self.translation_is_current() and self.engine.is_alive()
-                and self.engine.device == self.device_mode.currentData()
-                and self.engine.ocr_mode == self.ocr_mode.currentData()):
+        if self.translation_is_current() and self.engine.is_alive():
             self.status.setText('이미 적용된 설정입니다.')
             return
         self.worker_ready = False
         self.reset_for_settings()
         self.pending_device = self.device_mode.currentData()
-        self.pending_ocr_mode = self.ocr_mode.currentData()
         self.pending_source_language = self.source_language.currentData()
         self.pending_api_key = self.selected_api_key()
         self.pending_provider = self.translation_mode.currentData()
@@ -1180,14 +1351,15 @@ class Controller(QWidget):
         self.signals.ready.disconnect(self.ready)
         self.signals.result.disconnect(self.accept_result)
         self.signals.finished.disconnect(self.frame_finished)
+        self.signals.progress.disconnect(self.update_progress)
         self.device_mode.setEnabled(False)
-        self.ocr_mode.setEnabled(False)
         self.source_language.setEnabled(False)
         self.api_key.setEnabled(False)
         self.deepl_api_key.setEnabled(False)
         self.translation_mode.setEnabled(False)
         self.openai_panel.setEnabled(False)
         self.status.setText('현재 작업 종료 후 설정을 적용합니다…')
+        self.stop_progress('설정 적용 대기')
         self.device_timer = QTimer(self)
         self.device_timer.setInterval(100)
         self.device_timer.timeout.connect(self.finish_device_change)
@@ -1197,17 +1369,18 @@ class Controller(QWidget):
         if self.engine.is_alive():
             return
         self.device_timer.stop()
+        models = self.engine.ocr_models if self.engine.device == self.pending_device else None
         self.signals = Signals()
-        self.engine = Engine(self.signals, device=self.pending_device, ocr_mode=self.pending_ocr_mode,
+        self.engine = Engine(self.signals, device=self.pending_device,
                              api_key=self.pending_api_key, provider=self.pending_provider,
                              base_url=self.pending_base_url, model=self.pending_model,
-                             io_logger=self.io_logger, source_language=self.pending_source_language)
+                             io_logger=self.io_logger, source_language=self.pending_source_language,
+                             ocr_models=models)
         self.engine.generation = self.result_floor
         self.engine.cancel_before = self.result_floor
         self.engine.detector_size = self.detection_mode.currentData()
         self.connect_engine()
         self.device_mode.setEnabled(True)
-        self.ocr_mode.setEnabled(True)
         self.source_language.setEnabled(True)
         self.api_key.setEnabled(True)
         self.deepl_api_key.setEnabled(True)
@@ -1227,7 +1400,8 @@ class Controller(QWidget):
                 self.submit_snapshot()
             return
         label = 'GPU (CUDA)' if self.engine.device == 'cuda' else 'CPU'
-        self.status.setText(f'{label} · {MODES[self.engine.ocr_mode]} · {TRANSLATION_MODES[self.engine.provider]} 준비 완료 (OCR은 첫 요청 시 로딩) · 번역 시작을 누르세요.')
+        warning = ' · TrOCR 로딩 실패: 영어는 EasyOCR 사용' if self.engine.ocr_models.handwriting_failed else ''
+        self.status.setText(f'{label} · {TRANSLATION_MODES[self.engine.provider]} 준비 완료{warning} · 번역 시작을 누르세요.')
 
     def processing_failed(self, engine, generation, message):
         if engine is not self.engine or not engine.valid(generation):
@@ -1237,12 +1411,15 @@ class Controller(QWidget):
             self.toggle_button.setText('번역 시작')
             self.show()
         self.status.setText(message)
+        self.stop_progress('오류 · 상태 메시지를 확인하세요')
 
     def change_detection_mode(self, *_):
         self.engine.detector_size = self.detection_mode.currentData()
         self.reset_frame()
 
     def reset_frame(self, *_):
+        if self.worker_ready:
+            self.stop_progress('번역 대기')
         self.capture.invalidate()
         if self.single_shot:
             self.running = False
@@ -1398,6 +1575,11 @@ class Controller(QWidget):
         self.status.setText('화면 변화 감시 중…' if self.running else '일시정지')
 
     def tick(self):
+        self.resource_monitor.set_active(self.running and self.engine.processing.is_set()
+                                         and not self.engine.stop_event.is_set())
+        usage = self.resource_monitor.snapshot().text()
+        if usage != self.resource_note.text():
+            self.resource_note.setText(usage)
         if not self.running or self.region is None or self.single_shot:
             return
         if not self.translation_is_current():
@@ -1466,6 +1648,8 @@ class Controller(QWidget):
                 self.status.setText(f'{len(self.overlay.rows)}개 영역 표시 · 화면 변화 대기 중')
 
     def closeEvent(self, event):
+        self.resource_monitor.close()
+        self.save_current_ui_settings()
         self.settings_dialog.close()
         self.deepl_usage_closed = True
         self.deepl_usage_debounce.stop()
