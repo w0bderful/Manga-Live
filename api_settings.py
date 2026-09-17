@@ -1,4 +1,4 @@
-import json
+from json_storage import read_object, write_object
 import os
 from uuid import uuid4
 from app_settings import read_settings, update_settings
@@ -13,18 +13,11 @@ LEGACY_FILES = {'kie_api_key': ROOT / 'kie-api-key.json',
 
 
 def read_keys(path):
-    if not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(data, dict):
-        raise ValueError('API 키 파일은 JSON 객체여야 합니다.')
-    return data
+    return read_object(path, 'API 키 파일은 JSON 객체여야 합니다.')
 
 
 def write_keys(data):
-    temporary = API_KEYS_FILE.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    temporary.replace(API_KEYS_FILE)
+    write_object(API_KEYS_FILE, data)
 
 
 def read_key_file(path, fields, recover=False, required=False):

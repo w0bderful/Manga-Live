@@ -1,4 +1,4 @@
-import json
+from json_storage import read_object, write_object
 from pathlib import Path
 import threading
 
@@ -17,19 +17,11 @@ _lock = threading.RLock()
 
 
 def read_settings(path=None):
-    path = Path(path) if path is not None else SETTINGS_FILE
-    if not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(data, dict):
-        raise ValueError('설정 파일은 JSON 객체여야 합니다.')
-    return data
+    return read_object(Path(path) if path is not None else SETTINGS_FILE, '설정 파일은 JSON 객체여야 합니다.')
 
 
 def write_settings(data, path):
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    temporary.replace(path)
+    write_object(path, data)
 
 
 def update_settings(changes, path=None):

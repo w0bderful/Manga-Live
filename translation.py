@@ -114,7 +114,18 @@ def list_openai_models(base_url, api_key=''):
         connection.close()
 
 
-class OpenAICompatibleTranslationClient:
+class TranslationConnection:
+    """Close reusable HTTP connections on both success and failure."""
+    async def __aexit__(self, *args):
+        self.close()
+
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+
+class OpenAICompatibleTranslationClient(TranslationConnection):
     def __init__(self, api_key, base_url, model):
         self.api_key, self.model = api_key.strip(), model.strip()
         validate_openai_settings(base_url, self.model, self.api_key)
@@ -124,13 +135,6 @@ class OpenAICompatibleTranslationClient:
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, *args):
-        self.close()
-
-    def close(self):
-        if self.connection is not None:
-            self.connection.close()
-            self.connection = None
 
     async def translate(self, text, src='ja', dest='ko'):
         prompt = translation_prompt(src, dest)
@@ -238,7 +242,7 @@ def parse_deepl_usage(data, *, free):
                 remaining=min(remaining) if remaining else None)
 
 
-class DeepLTranslationClient:
+class DeepLTranslationClient(TranslationConnection):
     def __init__(self, api_key):
         self.api_key = api_key.strip()
         self.host = deepl_host(self.api_key)
@@ -249,13 +253,6 @@ class DeepLTranslationClient:
             raise ValueError('DeepL API 키를 입력하세요.')
         return self
 
-    async def __aexit__(self, *args):
-        self.close()
-
-    def close(self):
-        if self.connection is not None:
-            self.connection.close()
-            self.connection = None
 
     async def translate(self, text, src='ja', dest='ko'):
         translation_prompt(src, dest)
@@ -336,7 +333,7 @@ def read_stream(response):
     raise RuntimeError('Kie API 스트림이 번역 완료 전에 종료되었습니다. 다시 번역을 눌러주세요.')
 
 
-class LunaTranslationClient:
+class LunaTranslationClient(TranslationConnection):
     def __init__(self, api_key):
         self.api_key = api_key.strip()
         validate_api_key(self.api_key)
@@ -347,13 +344,6 @@ class LunaTranslationClient:
             raise ValueError('Luna 번역에는 Kie API 키가 필요합니다.')
         return self
 
-    async def __aexit__(self, *args):
-        self.close()
-
-    def close(self):
-        if self.connection is not None:
-            self.connection.close()
-            self.connection = None
 
     async def translate(self, text, src='ja', dest='ko'):
         prompt = translation_prompt(src, dest)

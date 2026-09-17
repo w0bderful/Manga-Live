@@ -365,11 +365,19 @@ Windows 캡처 보호가 확인되면 경고 창을 표시하고 해당 번역 �
 | 파일 | 역할 |
 | --- | --- |
 | `assets/` | 프로그램 아이콘 |
-| `main.py` | UI, 영역 선택, 번역 작업 관리, 오버레이 표시 |
+| `main.py` | 프로그램 진입점, 로그 준비와 Qt 실행 |
+| `controller.py` | 화면 구성, 사용자 조작, 설정 적용과 작업 상태 관리 |
+| `engine.py` | 백그라운드 OCR·번역 작업, 취소·재시도와 결과 캐시 |
+| `overlay.py` | 한국어 가로·세로 글자 배치와 번역 오버레이 표시 |
+| `selection.py` | 드래그 선택, 선택 영역 테두리와 Windows 화면 좌표 |
+| `model_combo.py` | 모델 목록을 비동기로 불러오는 선택 위젯 |
 | `core.py` | 영역 처리, 화면 변화 감지, 스크롤·위치 추적 |
 | `resource_usage.py` | 프로그램 CPU·GPU·VRAM 사용량 및 갱신 주기 관리 |
 | `window_theme.py` | 프로그램·설정창의 벚꽃잎 애니메이션과 버튼·입력칸 색상 |
-| `ocr_backends.py` | 감지 방식 선택, OCR 감지·인식과 CPU·GPU 처리 |
+| `ocr_backends.py` | 감지 방식·언어별 OCR 연결과 영어 인식 순서 선택 |
+| `ocr_models.py` | CPU·GPU 검증, OCR 모델 준비와 재사용 |
+| `ocr_regions.py` | 기존 OpenCV 후보 감지, 글줄 병합·말풍선 경계 보정 |
+| `ocr_image.py` | 공통 이미지 보정, 언어 판별 보조와 이미지 캐시 키 |
 | `comic_detector.py` | Comic Text Detector 모델 다운로드·검증, ONNX 감지와 좌표 복원 |
 | `handwriting_ocr.py` | 영어 인식 결과 검사와 로컬 TrOCR 모델 |
 | `translation.py` | 번역 API 요청, 모델 목록·DeepL 잔여 한도 조회 |
@@ -377,6 +385,8 @@ Windows 캡처 보호가 확인되면 경고 창을 표시하고 해당 번역 �
 | `app_settings.py` | 통합 설정 읽기·저장과 원문 언어 검증 |
 | `overlay_settings.py` | 통합 설정 안의 글꼴·크기·배경 불투명도 검증과 저장 |
 | `api_settings.py` | API 키 저장·복원·이전 키 형식 처리 |
+| `json_storage.py` | JSON 객체 읽기와 임시 파일을 통한 안전한 저장 |
+| `background_tasks.py` | 모델 목록·사용량 조회를 위한 백그라운드 실행 |
 | `hotkeys.py` | 전역 단축키와 단축키 설정창 |
 | `translation_logs.py` | 날짜별 실행·번역 입출력 기록과 3일이 지난 로그 정리 |
 | `requirements.txt` | Python 의존성 |
