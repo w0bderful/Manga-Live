@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QCheckBox, QLineEdit,
     QFormLayout, QMenuBar, QDialog, QScrollArea,
     QGridLayout, QMessageBox, QFontComboBox, QSpinBox,
-    QProgressBar, QSizePolicy,
+    QSizePolicy,
 )
 from core import changed, relocate, merge_row, scroll_offset, move_rows
 from translation import (
@@ -37,6 +37,7 @@ from engine import Engine, Signals
 from overlay import Overlay
 from selection import native_region, RegionIndicator, Selector
 from model_combo import ModelComboBox
+from smooth_progress import SmoothProgressBar
 log = logging.getLogger(__name__)
 
 
@@ -462,12 +463,13 @@ class Controller(QWidget):
         self.status = QLabel('준비 중…')
         self.status.setWordWrap(True)
         self.main_layout.addWidget(self.status)
-        self.progress_bar = QProgressBar()
+        self.progress_bar = SmoothProgressBar()
         self.progress_bar.setRange(0, 5 if initial_ui['detection_method'] == 'comic' else 4)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat('OCR 로딩 대기')
         self.task_progress = (0, self.progress_bar.maximum(), 'OCR 로딩 대기')
         self.release_progress = None
+        self._showing_release_progress = False
         self.progress_bar.setMinimumHeight(22)
         self.main_layout.addWidget(self.progress_bar)
         self.capture_note = QLabel('')
@@ -777,9 +779,11 @@ class Controller(QWidget):
 
     def render_progress(self):
         done, total, label = self.release_progress or self.task_progress
-        self.progress_bar.setRange(0, total)
-        self.progress_bar.setValue(done)
-        self.progress_bar.setFormat(label)
+        showing_release = self.release_progress is not None
+        self.progress_bar.set_progress(
+            done, total, label, reset=showing_release != self._showing_release_progress,
+        )
+        self._showing_release_progress = showing_release
 
     def update_model_download(self, engine, info):
         if engine is not self.engine or engine.stop_event.is_set():
