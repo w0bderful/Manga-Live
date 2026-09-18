@@ -3,9 +3,11 @@ import ctypes
 import hashlib
 import http.client
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -18,6 +20,7 @@ import multiprocessing
 import self_update
 
 BLOCK = 1024 * 1024
+log = logging.getLogger(__name__)
 
 
 class Cancelled(Exception):
@@ -223,6 +226,57 @@ def cleanup_downloads(cache):
         pass  # A cleanup failure must not stop a verified installation.
 
 
+def cleanup_old_runtimes(home, current):
+    """Remove obsolete installations only after the selected app starts successfully."""
+    home = Path(home).resolve()
+    store = home/'.manga-live-runtime'
+    current = Path(current).resolve()
+    lock = None
+    try:
+        if (store.is_symlink() or store.resolve() != store
+                or current.parent != store or not re.fullmatch('[0-9a-f]{24}', current.name)
+                or (current/'.complete').read_text(encoding='ascii') != current.name
+                or (current/'.startup-pending').exists()):
+            return
+        if sys.platform == 'win32':
+            import msvcrt
+            lock = (store/'launcher.lock').open('a+b')
+            if lock.seek(0, 2) == 0:
+                lock.write(b'0'); lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        for directory in store.iterdir():
+            match = re.fullmatch('(cleanup-)?([0-9a-f]{24})', directory.name)
+            if (not match or match[2] == current.name or directory.is_symlink()
+                    or not directory.is_dir() or directory.resolve() != directory):
+                continue
+            identity = match[2]
+            try:
+                if not match[1]:
+                    if (directory/'.complete').read_text(encoding='ascii') != identity:
+                        continue
+                    # Rename first so a partial deletion can be retried even if
+                    # .complete has already been removed. Locked folders stay put.
+                    retired = store/('cleanup-'+identity)
+                    if retired.exists() or retired.is_symlink() or retired.resolve() != retired:
+                        continue
+                    directory.rename(retired)
+                    directory = retired
+                if directory.resolve() != directory or directory.parent != store or directory.is_symlink():
+                    continue
+                shutil.rmtree(directory)
+                cache = store/(identity+'-downloads')
+                if not cache.is_symlink() and cache.resolve() == cache:
+                    cleanup_downloads(cache)
+            except (OSError, ValueError):
+                log.warning('이전 런타임 정리를 다음 실행에서 다시 시도합니다: %s', identity)
+    except (OSError, ValueError):
+        log.warning('이전 런타임을 정리하지 못했습니다. 다음 실행에서 다시 시도합니다.')
+    finally:
+        if lock is not None:
+            lock.close()
+
+
 _dll_handles = []
 
 
@@ -259,15 +313,26 @@ def launch(entrypoint, home):
     application = importlib.import_module('main')
     import inspect
     if 'on_ready' in inspect.signature(application.main).parameters:
-        return application.main(on_ready=lambda: pending.unlink(missing_ok=True))
+        def on_ready():
+            pending.unlink(missing_ok=True)
+            try:
+                threading.Thread(target=cleanup_old_runtimes,
+                                 args=(home, pending.parent), daemon=True,
+                                 name='runtime-cleanup').start()
+            except RuntimeError:
+                log.warning('이전 런타임 정리를 다음 실행으로 미룹니다.')
+        return application.main(on_ready=on_ready)
     # Reused older runtimes have no ready callback. Imports succeeded; still
     # request verification if their entrypoint raises during startup.
     pending.unlink(missing_ok=True)
     try:
-        return application.main()
+        result = application.main()
     except Exception:
         pending.write_text('failed', encoding='ascii')
         raise
+    if result in (None, 0):
+        cleanup_old_runtimes(home, pending.parent)
+    return result
 
 
 def main():
