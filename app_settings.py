@@ -12,6 +12,7 @@ UI_DEFAULTS = {
     'monitor': '', 'interface_mode': 'basic', 'always_on_top': True,
     'device': 'cuda', 'detection_size': None,
     'single_balloon': False, 'detection_method': DEFAULT_DETECTION_METHOD,
+    'window_sizes': {},
 }
 _lock = threading.RLock()
 
@@ -63,6 +64,18 @@ def validate_ui_settings(value):
     size = result['detection_size']
     if size is not None and (type(size) is not int or size not in (960, 1280, 1920)):
         raise ValueError('잘못된 감지 해상도입니다.')
+    window_sizes = result['window_sizes']
+    if not isinstance(window_sizes, dict):
+        raise ValueError('잘못된 창 크기 설정입니다.')
+    result['window_sizes'] = {}
+    for mode in ('basic', 'advanced'):
+        dimensions = window_sizes.get(mode)
+        if dimensions is None:
+            continue
+        if (not isinstance(dimensions, (list, tuple)) or len(dimensions) != 2
+                or any(type(n) is not int or not 100 <= n <= 32768 for n in dimensions)):
+            raise ValueError('잘못된 창 크기 설정입니다.')
+        result['window_sizes'][mode] = list(dimensions)
     return {key: result[key] for key in UI_DEFAULTS}
 
 

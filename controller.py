@@ -3,14 +3,14 @@ from background_tasks import submit_background
 import logging
 from runtime_paths import APP_DIR as ROOT
 import time
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QSignalBlocker
 from PyQt6.QtGui import QFont, QAction, QActionGroup
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel,
     QPushButton, QComboBox, QCheckBox, QLineEdit,
     QFormLayout, QMenuBar, QDialog, QScrollArea,
     QGridLayout, QMessageBox, QFontComboBox, QSpinBox,
-    QProgressBar,
+    QProgressBar, QSizePolicy,
 )
 from core import changed, relocate, merge_row, scroll_offset, move_rows
 from translation import (
@@ -21,8 +21,8 @@ from api_settings import (
     load_translation_provider,
 )
 from window_capture import CaptureWithoutApp, CaptureProtectionError
-from hotkeys import ACTIONS, HotkeyDialog, WindowsHotkeys, load_settings
-from overlay_settings import load_text_style, save_text_style
+from hotkeys import ACTIONS, DEFAULTS as DEFAULT_HOTKEYS, HotkeyDialog, WindowsHotkeys, load_settings
+from overlay_settings import DEFAULT_TEXT_STYLE, load_text_style, save_text_style
 from window_theme import (
     SakuraBackdrop, apply_window_theme, WINDOW_THEMES, DEFAULT_WINDOW_THEME,
     load_window_theme, save_window_theme,
@@ -31,7 +31,7 @@ from resource_usage import ResourceMonitor
 from update_ui import VersionUpdater
 from app_settings import (
     SOURCE_LANGUAGES, DEFAULT_SOURCE_LANGUAGE, load_source_language, save_source_language,
-    UI_DEFAULTS, load_ui_settings, save_ui_settings, DETECTION_METHODS,
+    UI_DEFAULTS, load_ui_settings, save_ui_settings, DETECTION_METHODS, update_settings,
 )
 from engine import Engine, Signals
 from overlay import Overlay
@@ -52,19 +52,24 @@ class Controller(QWidget):
     def __init__(self, io_logger=None):
         super().__init__()
         self.restoring_settings = True
+        self.window_size_timer = QTimer(self)
+        self.window_size_timer.setSingleShot(True)
+        self.window_size_timer.setInterval(500)
+        self.window_size_timer.timeout.connect(self.save_current_ui_settings)
         ui_error = ''
         try:
             initial_ui = load_ui_settings()
         except (OSError, ValueError):
             initial_ui = dict(UI_DEFAULTS)
             ui_error = '화면 설정을 읽지 못해 기본값을 사용합니다. settings.json을 확인하세요.'
+        self.window_sizes = dict(initial_ui.get('window_sizes', {}))
         self.io_logger = io_logger
         self.setWindowTitle('Manga Live · 화면 → 한국어')
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, initial_ui['always_on_top'])
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAutoFillBackground(True)
-        self.resize(510, 230)
+        self.resize(470, 270)
         self.sakura_background = SakuraBackdrop(self)
         theme_error = ''
         try:
@@ -160,6 +165,12 @@ class Controller(QWidget):
         self.version_updates = VersionUpdater(self, ROOT)
         self.version_updates.progress_changed.connect(self.update_release_progress)
         self.main_layout.addWidget(self.version_updates.panel)
+        self.main_layout.addStretch(0)
+        self.window_space = self.main_layout.itemAt(self.main_layout.count() - 1).spacerItem()
+        self.reset_defaults_button = QPushButton('기본값으로 초기화')
+        self.reset_defaults_button.setToolTip('API 키는 보존하고 선택 설정과 창 크기를 기본값으로 되돌립니다.')
+        self.reset_defaults_button.clicked.connect(self.reset_defaults)
+        self.main_layout.addWidget(self.reset_defaults_button)
         self.resource_monitor = ResourceMonitor()
         self.resource_monitor.start()
         self.settings_layout.addStretch()
@@ -193,6 +204,7 @@ class Controller(QWidget):
         cell_layout = QVBoxLayout(cell)
         cell_layout.setContentsMargins(0,0,0,0)
         cell_layout.setSpacing(4)
+        cell_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         cell_layout.addWidget(QLabel(label))
         cell_layout.addWidget(control)
         control.setMinimumContentsLength(10)
@@ -245,6 +257,7 @@ class Controller(QWidget):
         self.settings_panel = QWidget()
         self.settings_layout = QVBoxLayout(self.settings_panel)
         self.settings_layout.setContentsMargins(8, 8, 8, 8)
+        self.settings_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.settings_grid = QGridLayout()
         self.settings_grid.setHorizontalSpacing(12)
         self.settings_grid.setVerticalSpacing(10)
@@ -467,12 +480,14 @@ class Controller(QWidget):
     def save_current_ui_settings(self, *_):
         if self.restoring_settings:
             return
+        self.remember_window_size()
         settings = {
             'monitor': self.screens.currentText(), 'interface_mode': self.interface_mode,
             'always_on_top': self.always_on_top.isChecked(), 'device': self.device_mode.currentData(),
             'detection_size': self.detection_mode.currentData(),
             'detection_method': self.detection_method.currentData(),
             'single_balloon': self.manual.isChecked(),
+            'window_sizes': self.window_sizes,
         }
         try:
             save_ui_settings(settings)
@@ -502,9 +517,120 @@ class Controller(QWidget):
             self.theme_note.clear()
             self.theme_note.hide()
 
+    def reset_defaults(self):
+        if hasattr(self, 'device_timer') and self.device_timer.isActive():
+            self.status.setText('설정 적용이 끝난 뒤 다시 초기화하세요.')
+            return
+        answer = QMessageBox.question(
+            self, '기본값으로 초기화',
+            '모든 선택 설정과 창 크기를 기본값으로 되돌릴까요?\n'
+            '진행 중인 번역은 중지됩니다. API 키·다운로드 모델·로그는 보존합니다.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if hasattr(self, 'device_timer') and self.device_timer.isActive():
+            self.status.setText('설정 적용이 끝난 뒤 다시 초기화하세요.')
+            return
+        # Preserve any API key edits waiting for the existing save timer.
+        if self.api_key_save_timer.isActive() and not self.save_api_key():
+            return
+        defaults = {
+            'ui': {**UI_DEFAULTS, 'window_sizes': {}},
+            'source_language': DEFAULT_SOURCE_LANGUAGE, 'translation_provider': 'luna',
+            'openai_base_url': OPENAI_DEFAULTS['base_url'], 'openai_model': OPENAI_DEFAULTS['model'],
+            'window_theme': DEFAULT_WINDOW_THEME, 'text_style': dict(DEFAULT_TEXT_STYLE),
+            'hotkeys': dict(DEFAULT_HOTKEYS),
+        }
+        try:
+            update_settings(defaults)
+        except (OSError, ValueError):
+            QMessageBox.warning(self, '초기화 실패', '설정을 저장하지 못했습니다. settings.json의 상태와 권한을 확인하세요.')
+            return
+        self.window_size_timer.stop()
+        self.running = False
+        self.single_shot = False
+        self.toggle_button.setText('번역 시작')
+        self.reset_frame()
+        self.region = None
+        self.region_indicator.hide_timer.stop()
+        self.region_indicator.hide()
+        self.restoring_settings = True
+        controls = (self.screens, self.device_mode, self.detection_method, self.detection_mode,
+                    self.manual, self.always_on_top, self.translation_mode, self.source_language,
+                    self.openai_base_url, self.openai_model, self.translation_font,
+                    self.translation_font_size, self.text_background_opacity)
+        blockers = [QSignalBlocker(control) for control in controls]
+        try:
+            self.settings_dialog.close()
+            self.screens.setCurrentIndex(0)
+            for control, value in ((self.device_mode, UI_DEFAULTS['device']),
+                                   (self.detection_method, UI_DEFAULTS['detection_method']),
+                                   (self.detection_mode, UI_DEFAULTS['detection_size']),
+                                   (self.translation_mode, 'luna'),
+                                   (self.source_language, DEFAULT_SOURCE_LANGUAGE)):
+                control.setCurrentIndex(control.findData(value))
+            self.api_key.show()
+            self.deepl_api_key.hide()
+            self.deepl_usage_panel.hide()
+            self.openai_panel.hide()
+            self.manual.setChecked(UI_DEFAULTS['single_balloon'])
+            self.always_on_top.setChecked(UI_DEFAULTS['always_on_top'])
+            self.set_always_on_top(UI_DEFAULTS['always_on_top'])
+            self.openai_base_url.setText(OPENAI_DEFAULTS['base_url'])
+            self.invalidate_model_list()
+            self.translation_font.setCurrentFont(QFont(DEFAULT_TEXT_STYLE['font_family']))
+            self.translation_font_size.setValue(DEFAULT_TEXT_STYLE['font_size'])
+            self.text_background_opacity.setValue(DEFAULT_TEXT_STYLE['background_opacity'])
+            self.overlay.text_style = dict(DEFAULT_TEXT_STYLE)
+            self.selected_window_theme = DEFAULT_WINDOW_THEME
+            self.window_theme_actions[DEFAULT_WINDOW_THEME].setChecked(True)
+            self.apply_selected_window_theme()
+            self.hotkey_settings = dict(DEFAULT_HOTKEYS)
+            self.update_hotkey_note(self.hotkeys.apply(self.hotkey_settings))
+            self.window_sizes = {}
+            self.showNormal()
+            self.set_interface_mode(UI_DEFAULTS['interface_mode'])
+            self.main_layout.activate()
+            self.restore_window_size()
+            self.engine.detector_size = UI_DEFAULTS['detection_size']
+            for note in (self.ui_settings_note, self.language_note, self.text_style_note, self.theme_note):
+                note.clear()
+                note.hide()
+        finally:
+            for blocker in blockers:
+                blocker.unblock()
+            self.restoring_settings = False
+        self.update_translation_fields()
+
+    def remember_window_size(self):
+        if (self.restoring_settings or getattr(self, '_changing_window_layout', False) or not self.isVisible()
+                or self.isMinimized() or self.isMaximized() or self.isFullScreen()
+                or self.interface_mode not in ('basic', 'advanced')):
+            return
+        if self.interface_mode == 'advanced' and self.dialog_settings.widget() is self.settings_panel:
+            return  # Temporarily compact while advanced controls are in the dialog.
+        self.window_sizes[self.interface_mode] = [self.width(), self.height()]
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if (not getattr(self, 'restoring_settings', True) and not getattr(self, '_closing', False)
+                and not getattr(self, '_changing_window_layout', False)):
+            self.remember_window_size()
+            self.window_size_timer.start()
+
+    def restore_window_size(self):
+        advanced = self.interface_mode == 'advanced'
+        default = [520, 800] if advanced else [470, self.minimumSizeHint().height() + 40]
+        width, height = self.window_sizes.get(self.interface_mode, default)
+        available = self.screen().availableGeometry()
+        self.resize(min(width, available.width()), min(height, available.height() - 80))
+
     def set_interface_mode(self, mode):
         if mode == self.interface_mode:
             return
+        self.remember_window_size()
+        self._changing_window_layout = True
         self.settings_dialog.hide()
         for scroll in (self.inline_settings, self.dialog_settings):
             if scroll.widget() is self.settings_panel:
@@ -530,9 +656,12 @@ class Controller(QWidget):
         self.interface_mode = mode
         self.basic_mode_action.setChecked(not advanced)
         self.advanced_mode_action.setChecked(advanced)
+        self.window_space.changeSize(0, 0, QSizePolicy.Policy.Minimum,
+                                     QSizePolicy.Policy.Minimum if advanced else QSizePolicy.Policy.Expanding)
+        self.main_layout.invalidate()
         self.main_layout.activate()
-        available = self.screen().availableGeometry()
-        self.resize(560 if advanced else 510, min(760, available.height() - 80) if advanced else self.minimumSizeHint().height())
+        self.restore_window_size()
+        self._changing_window_layout = False
         self.save_current_ui_settings()
 
     def change_text_style(self, *_):
@@ -553,13 +682,15 @@ class Controller(QWidget):
 
     def open_settings(self):
         if self.inline_settings.widget() is self.settings_panel:
+            self.remember_window_size()
             self.inline_settings.takeWidget()
             self.dialog_settings.setWidget(self.settings_panel)
             self.settings_panel.setAutoFillBackground(False)
             self.inline_settings.hide()
             self.settings_panel.show()
             self.main_layout.activate()
-            self.resize(self.width(), self.minimumSizeHint().height())
+            self.resize(self.width(), min(self.minimumSizeHint().height() + 40,
+                                          self.screen().availableGeometry().height() - 80))
         available = self.screen().availableGeometry()
         self.settings_dialog.resize(560, min(760, available.height() - 80))
         self.settings_dialog.show()
@@ -568,12 +699,17 @@ class Controller(QWidget):
 
     def restore_inline_settings(self):
         if self.interface_mode == 'advanced' and self.dialog_settings.widget() is self.settings_panel:
-            self.dialog_settings.takeWidget()
-            self.inline_settings.setWidget(self.settings_panel)
-            self.settings_panel.setAutoFillBackground(False)
-            self.inline_settings.show()
-            self.settings_panel.show()
-            self.resize(560, min(760, self.screen().availableGeometry().height() - 80))
+            changing = getattr(self, '_changing_window_layout', False)
+            self._changing_window_layout = True
+            try:
+                self.dialog_settings.takeWidget()
+                self.inline_settings.setWidget(self.settings_panel)
+                self.settings_panel.setAutoFillBackground(False)
+                self.inline_settings.show()
+                self.settings_panel.show()
+                self.restore_window_size()
+            finally:
+                self._changing_window_layout = changing
 
     def update_hotkey_note(self, errors=()):
         buttons = {'select': self.select_button, 'drag': self.drag_button,
@@ -1181,6 +1317,8 @@ class Controller(QWidget):
         self.version_updates.close()
         self.resource_monitor.close()
         self.save_current_ui_settings()
+        self._closing = True
+        self.window_size_timer.stop()
         self.settings_dialog.close()
         self.deepl_usage_closed = True
         self.deepl_usage_debounce.stop()
