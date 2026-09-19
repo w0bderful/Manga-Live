@@ -53,6 +53,20 @@ QLineEdit, QComboBox, QSpinBox, QKeySequenceEdit {
     selection-background-color: #80506f; selection-color: white;
 }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #ffc7e0; }
+QSpinBox { padding-right: 56px; min-height: 24px; }
+QSpinBox::up-button, QSpinBox::down-button {
+    subcontrol-origin: padding; subcontrol-position: center right;
+    width: 24px; height: 24px;
+    background: #342b3c; border: 1px solid #7e6579; border-radius: 3px;
+}
+QSpinBox::up-button { right: 28px; }
+QSpinBox::down-button { right: 1px; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #554057; }
+QSpinBox::up-button:pressed, QSpinBox::down-button:pressed { background: #70506a; }
+QSpinBox::up-button:disabled, QSpinBox::down-button:disabled { background: #24212d; }
+QSpinBox::up-arrow { image: url("SPIN_UP_ASSET"); width: 10px; height: 6px; }
+QSpinBox::down-arrow { image: url("SPIN_DOWN_ASSET"); width: 10px; height: 6px; }
+QSpinBox::up-arrow:disabled, QSpinBox::down-arrow:disabled { image: none; }
 QComboBox QAbstractItemView {
     background: #302735; color: #fff5fa;
     selection-background-color: #79536b; selection-color: white;
@@ -71,6 +85,8 @@ QCheckBox::indicator:checked {
 }
 '''
 STYLE = STYLE.replace('CHECKMARK_ASSET',(RESOURCE_DIR/'assets/checkmark.svg').as_posix())
+STYLE = STYLE.replace('SPIN_UP_ASSET', (RESOURCE_DIR/'assets/spin-up.svg').as_posix())
+STYLE = STYLE.replace('SPIN_DOWN_ASSET', (RESOURCE_DIR/'assets/spin-down.svg').as_posix())
 
 
 class SakuraBackdrop(QWidget):
