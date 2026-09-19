@@ -73,10 +73,12 @@ python -m venv .venv
 
 ```powershell
 .\.venv\Scripts\python.exe build_exe.py --runtime --output output/integrated-runtime
-.\.venv\Scripts\python.exe build_downloader.py --source "output/integrated-runtime/Manga Live" --asset-base-url https://github.com/w0bderful/Manga-Live/releases/download/런타임태그
+.\.venv\Scripts\python.exe build_downloader.py --source "output/integrated-runtime/Manga Live" --asset-base-url http://103.244.118.48/런타임태그
 ```
 
-`output/downloader/Manga Live.exe`와 `Manga-Live-runtime-*.zip`이 생성됩니다. ZIP 파일을 별도 런타임 릴리스에 먼저 게시하고, 사용자용 릴리스에는 EXE 하나만 올립니다. 사용자는 EXE 하나를 받고 실행하면 됩니다.
+`output/downloader/Manga Live.exe`와 `Manga-Live-runtime-*.zip`이 생성됩니다. ZIP 파일은 Ubuntu 서버의 `/srv/manga-live/런타임태그/`에 먼저 게시하고, GitHub의 사용자용 릴리스에는 EXE 하나만 올립니다. 사용자는 EXE 하나를 받고 실행하면 됩니다. 다운로드한 파일은 EXE에 포함된 크기와 SHA-256으로 검증합니다.
+
+런타임 내용이 같고 서버 주소만 옮기는 경우 `build_downloader.py --relocate-runtime --asset-base-url 새주소`로 기존 매니페스트의 다운로드 주소만 변경하고 EXE를 다시 만듭니다. ZIP은 다시 압축하지 않으며 기존 파일을 새 서버로 복사합니다. 이전 GitHub 런타임 릴리스는 정리되었으므로 처음 설치하거나 런타임 복구가 필요하면 최신 릴리스의 EXE를 다시 받으세요.
 
 - 첫 실행 때 진행률을 표시하며 필요한 파일을 다운로드·검증·압축 해제합니다. Python 설치는 필요하지 않습니다.
 - 취소하거나 연결이 끊기면 다음 실행에서 다운로드를 재개합니다. 서버가 재개를 지원하지 않으면 해당 파일을 처음부터 다시 받습니다.

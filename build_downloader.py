@@ -8,6 +8,7 @@ from pathlib import Path
 import shlex
 import sys
 import zipfile
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 LIMIT = 1250 * 1024**2
@@ -34,14 +35,28 @@ def reusable_runtime(manifest_path, records):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--launcher-only', action='store_true', help='기존 매니페스트로 실행기만 다시 빌드')
+    parser.add_argument('--relocate-runtime', action='store_true', help='기존 런타임 내용은 유지하고 다운로드 주소만 변경')
     parser.add_argument('--source', default='output/integrated-runtime/Manga Live')
-    parser.add_argument('--asset-base-url', required=True, help='공개할 런타임 릴리스의 /download/<tag> 주소')
+    parser.add_argument('--asset-base-url', required=True, help='런타임 ZIP을 제공하는 HTTP(S) 디렉터리 주소')
     args = parser.parse_args()
     source = (ROOT/args.source).resolve()
     output = ROOT/'output/downloader'
     work = ROOT/'build/downloader'
     output.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
+    if args.relocate_runtime:
+        base = args.asset_base_url.rstrip('/')
+        parsed = urlsplit(base)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise SystemExit('인증 정보·쿼리 없는 HTTP(S) 런타임 주소를 지정하세요.')
+        manifest_path = work/'runtime-manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        for asset in manifest['assets']:
+            asset['url'] = base + '/' + asset['name']
+        from json_storage import write_object
+        write_object(manifest_path, manifest)
+        build_launcher(manifest_path, output, work)
+        return
     if args.launcher_only:
         build_launcher(work/'runtime-manifest.json',output,work)
         return
