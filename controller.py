@@ -161,7 +161,7 @@ class Controller(QWidget):
         self.main_layout.addWidget(self.ui_settings_note)
         self.resource_note = QLabel('CPU —  ·  GPU —  ·  VRAM —')
         self.resource_note.setWordWrap(True)
-        self.resource_note.setToolTip('현재 프로그램의 사용량입니다. CPU는 전체 논리 코어 기준, GPU는 가장 바쁜 엔진 기준, VRAM은 전용 GPU 메모리입니다. 조회 불가는 드라이버가 정보를 제공하지 않는 경우입니다.')
+        self.resource_note.setToolTip('현재 프로그램의 사용량입니다. CPU는 전체 논리 코어 기준, GPU는 가장 바쁜 엔진 기준, VRAM은 전용 GPU 메모리입니다.')
         self.main_layout.addWidget(self.resource_note)
         self.version_updates = VersionUpdater(self, ROOT)
         self.version_updates.progress_changed.connect(self.update_release_progress)
@@ -171,7 +171,9 @@ class Controller(QWidget):
         self.reset_defaults_button = QPushButton('기본값으로 초기화')
         self.reset_defaults_button.setToolTip('API 키는 보존하고 선택 설정과 창 크기를 기본값으로 되돌립니다.')
         self.reset_defaults_button.clicked.connect(self.reset_defaults)
-        self.main_layout.addWidget(self.reset_defaults_button)
+        self.settings_layout.insertWidget(
+            self.settings_layout.indexOf(self.hotkey_note) + 1, self.reset_defaults_button,
+        )
         self.resource_monitor = ResourceMonitor()
         self.resource_monitor.start()
         self.settings_layout.addStretch()

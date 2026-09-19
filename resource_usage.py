@@ -16,8 +16,8 @@ class ResourceUsage:
 
     def text(self):
         def percent(value):
-            return '조회 불가' if value is None else f'{value:.1f}%'
-        memory = '조회 불가' if self.vram is None else (
+            return '—' if value is None else f'{value:.1f}%'
+        memory = '—' if self.vram is None else (
             f'{self.vram / 1024**3:.2f} GiB' if self.vram >= 1024**3 else f'{self.vram / 1024**2:.0f} MiB')
         return f'CPU {percent(self.cpu)}  ·  GPU {percent(self.gpu)}  ·  VRAM {memory}'
 
