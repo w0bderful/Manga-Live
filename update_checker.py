@@ -14,7 +14,7 @@ import urllib.request
 from app_version import VERSION
 from app_settings import read_settings, update_settings
 
-INTERVAL = 7 * 24 * 60 * 60
+INTERVAL = 24 * 60 * 60
 REPOSITORY = 'https://github.com/w0bderful/Manga-Live'
 RELEASES_API = 'https://api.github.com/repos/w0bderful/Manga-Live/releases?per_page=100'
 
