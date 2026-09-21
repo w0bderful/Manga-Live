@@ -106,7 +106,7 @@ def line_groups(lines, pixels=None):
                 and (xo>0 or abs(a.y-b.y)<=max(2*max(a.w,b.w),.4*min(a.h,b.h))))
         else:
             connected = ((xo > .25*min(a.w,b.w) and -yo <= 1.5*min(a.h,b.h))
-                or (yo > .5*min(a.h,b.h) and -xo <= 2*min(a.h,b.h)))
+                or (yo > .5*min(a.h,b.h) and -xo <= .7*min(a.h,b.h)))
         if not connected or gray is None:
             return connected
         if xo<0 and yo>0:
@@ -197,7 +197,7 @@ def decode_outputs(outputs, width, height, pixels=None):
             for i,_ in members:
                 if group_for[i] not in matched_groups:
                     matched_groups.append(group_for[i])
-            if len(matched_groups) > 1 and vertical:
+            if len(matched_groups) > 1 and (vertical or all(len(group) >= 2 for group in matched_groups)):
                 # A model block may cover several adjacent balloons. Use line
                 # spacing at the original stroke scale before adding margins.
                 for group in matched_groups:

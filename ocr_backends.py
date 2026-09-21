@@ -161,7 +161,7 @@ class OcrBackend:
             return None
         corrected = prepare_ocr_image(pixels)
         pixels = corrected
-        scale = min(3.0, max(1.0, 64/min(crop.size)))
+        scale = min(3.0, max(1.0, 64/min(crop.size), 640/max(crop.size)))
         if scale > 1:
             pixels = cv2.resize(pixels, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         pixels = cv2.copyMakeBorder(pixels,16,16,16,16,cv2.BORDER_REPLICATE)
@@ -228,6 +228,17 @@ class OcrBackend:
         from handwriting_ocr import crop_text_line, usable_handwriting, classify_text_style
         if self.status:
             self.status('영어 글씨체 확인 중…')
+        gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+        # TrOCR expects dark ink on a light page; a dark title panel otherwise
+        # produces fluent but unrelated words even when CRAFT finds the lines.
+        border = np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1]))
+        if np.median(border) < 127 and np.mean(gray < 127) > .6:
+            pixels = cv2.bitwise_not(pixels)
+        # CRAFT can merge or miss tightly spaced, small comic lettering at its
+        # original scale. Enlarge before line detection, not only recognition.
+        scale = min(3.0, max(1.0, 640/max(pixels.shape[:2])))
+        if scale > 1:
+            pixels = cv2.resize(pixels, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         horizontal, free = reader.detect(pixels, min_size=5, text_threshold=.55,
             low_text=.25, link_threshold=.3, add_margin=.05)
         polygons = [[[x1,y1],[x2,y1],[x2,y2],[x1,y2]] for x1,x2,y1,y2 in horizontal[0]] + list(free[0])
@@ -269,7 +280,7 @@ class OcrBackend:
                     text = ' '.join(reader.recognize(np.asarray(line), detail=0, paragraph=False)).strip()
             if text:
                 lines.append((polygon, text, 1.0))
-        return ' '.join(row[1] for row in get_paragraph(lines, mode='ltr')).strip()
+        return ' '.join(row[1] for row in get_paragraph(lines, x_ths=.05, mode='ltr')).strip()
 
     def read_handwriting(self, line):
         if self.handwriting_failed:
