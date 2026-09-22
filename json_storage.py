@@ -16,6 +16,7 @@ def read_object(path, error_message):
 def write_object(path, data):
     path = Path(path)
     payload = json.dumps(data, ensure_ascii=False, indent=2) + '\n'
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + '.tmp')
     try:
         temporary.write_text(payload, encoding='utf-8')

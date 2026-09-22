@@ -18,9 +18,10 @@ class VersionUpdater(QObject):
     progress = pyqtSignal(int)
     progress_changed = pyqtSignal(int, int, str)
 
-    def __init__(self, parent, home):
+    def __init__(self, parent, home, *, settings_home=None):
         super().__init__(parent)
         self.home = home
+        self.settings_home = home if settings_home is None else settings_home
         self.closed = threading.Event()
         self.busy = False
         self.retry_after = 0
@@ -29,7 +30,7 @@ class VersionUpdater(QObject):
         row.setContentsMargins(0,0,0,0)
         self.label = QLabel('v'+VERSION)
         try:
-            pending = updates.load_state(home).get('pending_version','')
+            pending = updates.load_state(self.settings_home).get('pending_version','')
             if pending and updates.version_key(pending) > updates.version_key(VERSION):
                 self.label.setText('v'+pending+' · 다음 실행에 적용')
         except (OSError,ValueError):
@@ -72,7 +73,7 @@ class VersionUpdater(QObject):
             if time.time() < self.retry_after:
                 return
             try:
-                if not updates.check_due(updates.load_state(self.home)):
+                if not updates.check_due(updates.load_state(self.settings_home)):
                     return
             except (OSError,ValueError):
                 log.warning('Update preferences unavailable',exc_info=True)
@@ -105,7 +106,7 @@ class VersionUpdater(QObject):
         self.retry_after = 0
         save_note = ''
         try:
-            updates.save_state(self.home,{'last_checked':time.time()})
+            updates.save_state(self.settings_home,{'last_checked':time.time()})
         except (OSError,ValueError):
             self.retry_after = time.time()+3600
             save_note = ' · 확인 시각 저장 실패'
@@ -166,7 +167,7 @@ class VersionUpdater(QObject):
             QMessageBox.warning(self.parent(),'업데이트',error)
             return
         try:
-            updates.save_state(self.home,{'pending_version':result['version']})
+            updates.save_state(self.settings_home,{'pending_version':result['version']})
         except (OSError,ValueError):
             log.warning('Pending version could not be saved',exc_info=True)
         self.busy = True

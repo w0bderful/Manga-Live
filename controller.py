@@ -1,7 +1,7 @@
 """Main-window controls and coordination of independent application services."""
 from background_tasks import submit_background
 import logging
-from runtime_paths import APP_DIR as ROOT
+from runtime_paths import APP_DIR as ROOT, CONFIG_DIR
 import time
 from PyQt6.QtCore import Qt, QTimer, QSignalBlocker
 from PyQt6.QtGui import QFont, QAction, QActionGroup
@@ -163,7 +163,7 @@ class Controller(QWidget):
         self.resource_note.setWordWrap(True)
         self.resource_note.setToolTip('현재 프로그램의 사용량입니다. CPU는 전체 논리 코어 기준, GPU는 가장 바쁜 엔진 기준, VRAM은 전용 GPU 메모리입니다.')
         self.main_layout.addWidget(self.resource_note)
-        self.version_updates = VersionUpdater(self, ROOT)
+        self.version_updates = VersionUpdater(self, ROOT, settings_home=CONFIG_DIR)
         self.version_updates.progress_changed.connect(self.update_release_progress)
         self.main_layout.addWidget(self.version_updates.panel)
         self.main_layout.addStretch(0)
